@@ -262,11 +262,7 @@ impl Taker {
                     outgoing_locktime,
                 )?;
                 let swap = self.swap_state_mut()?;
-                for (swapcoin, sig) in swap
-                    .outgoing_swapcoins
-                    .iter_mut()
-                    .zip(sender_sigs.into_iter())
-                {
+                for (swapcoin, sig) in swap.outgoing_swapcoins.iter_mut().zip(sender_sigs) {
                     swapcoin.others_contract_sig = Some(sig);
                 }
                 let exch = self.swap_state_mut()?.makers[maker_idx].legacy_exchange_mut()?;
@@ -277,7 +273,16 @@ impl Taker {
             if is_first_peer && !taker_funding_broadcast {
                 log::info!("Broadcasting funding transactions and waiting for confirmation");
                 {
-                    let wallet = self.write_wallet()?;
+                    let mut wallet = self.write_wallet()?;
+
+                    // Persist the outgoing swapcoins (now carrying the maker's
+                    // contract signatures) to disk BEFORE broadcasting the funding txs.
+                    // Without this, a crash after broadcast leaves the wallet
+                    // store missing `others_contract_sig`, blocking timelock recovery.
+                    for swapcoin in &self.swap_state()?.outgoing_swapcoins {
+                        wallet.add_outgoing_swapcoin(swapcoin);
+                    }
+                    wallet.save_to_disk()?;
 
                     for swapcoin in &self.swap_state()?.outgoing_swapcoins {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
