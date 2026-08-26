@@ -17,9 +17,6 @@ jobs:
       - name: Set profile
         run: rustup set profile minimal
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install nightly toolchain
         run: rustup toolchain install nightly
 
@@ -41,12 +38,6 @@ jobs:
       - name: Clippy (main codebase with all features)
         run: cargo +stable clippy --all-features --lib --bins --tests -- -D warnings
 
-      - name: Build examples
-        run: cargo +stable build --examples
-
-      - name: Clippy (examples with default features only)
-        run: cargo +stable clippy --examples -- -D warnings
-
       # - name: cargo install cargo-hack
       #   uses: taiki-e/install-action@cargo-hack
 
@@ -61,3 +52,50 @@ jobs:
       - name: Run cargo-machete
         # Pointing to release v0.9.1
         uses: bnjbvr/cargo-machete@7959c845782fed02ee69303126d4a12d64f1db18
+
+  examples:
+    name: Rust examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protobuf compiler and Tor
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler tor
+
+      - name: Start Tor
+        run: |
+          mkdir -p /tmp/tor-ci/data
+          cat > /tmp/tor-ci/torrc <<'EOF'
+          SocksPort 9050
+          ControlPort 9051
+          CookieAuthentication 0
+          DataDirectory /tmp/tor-ci/data
+          EOF
+          tor -f /tmp/tor-ci/torrc &
+          for _ in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/9051) 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Tor failed to start" >&2
+          exit 1
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable
+
+      - name: Add clippy
+        run: rustup component add clippy --toolchain stable
+
+      - name: Build examples
+        run: cargo +stable build --examples
+
+      - name: Clippy examples
+        run: cargo +stable clippy --examples -- -D warnings
+
+      - name: Run wallet example
+        run: printf '\n' | cargo +stable run --example wallet_basic
+
+      - name: Run taker example
+        run: printf '\n' | cargo +stable run --example taker_basic
