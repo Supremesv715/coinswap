@@ -41,6 +41,9 @@ jobs:
       - name: Clippy (main codebase with all features)
         run: cargo +stable clippy --all-features --lib --bins --tests -- -D warnings
 
+      - name: Build examples
+        run: cargo +stable build --examples
+
       - name: Clippy (examples with default features only)
         run: cargo +stable clippy --examples -- -D warnings
 
