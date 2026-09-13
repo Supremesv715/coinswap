@@ -1210,6 +1210,14 @@ impl MakerServer {
             .is_empty())
     }
 
+    /// Outpoints this maker still holds reserved for in-flight swaps.
+    #[cfg(feature = "integration-test")]
+    pub fn live_reserved_inputs(&self) -> Result<usize, MakerError> {
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .live_reserved_inputs())
+    }
+
     /// Whether this maker has an unfinished outgoing swapcoin for `swap_id`.
     #[cfg(feature = "integration-test")]
     pub fn has_unfinished_outgoing_swapcoin(&self, swap_id: &str) -> Result<bool, MakerError> {

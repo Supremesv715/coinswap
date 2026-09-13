@@ -603,3 +603,108 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
         TakerBehavior::CrashAfterContractExchange,
     );
 }
+
+/// A maker that reserved inputs for a funding it never sent must still hold
+/// them after a restart: that funding can still reach the network, and handing
+/// those inputs to another swap would invite a conflicting transaction.
+///
+/// Route: Taker -> Maker1 (Normal) -> Maker2 (skips its funding broadcast and
+/// records nothing). Maker2 is restarted inside the grace, and must come back
+/// still holding what it reserved.
+#[test]
+fn reservations_survive_a_maker_restart() {
+    warn!("Running Test: swap input reservations survive a maker restart");
+
+    let makers_config_map = vec![(7452, Some(20951)), (17452, Some(20952))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+    for maker in &makers {
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+            .unwrap();
+    }
+
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    generate_blocks(bitcoind, 1);
+
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = taker.start_swap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap should fail: Maker2 skips its funding broadcast"
+    );
+
+    let victim = makers[1].clone();
+    let before = victim.live_reserved_inputs().unwrap();
+    assert!(
+        before > 0,
+        "Maker2 must reserve the inputs of the funding it planned"
+    );
+    info!("Maker2 holds {} reserved inputs before restart", before);
+
+    // The first init consumed the passphrase, so re-supply it as an operator
+    // would on restart.
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
+
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    drop(victim);
+    drop(makers);
+
+    let restarted = MakerServer::init(victim_config).unwrap();
+    let after = restarted.live_reserved_inputs().unwrap();
+    assert_eq!(
+        after, before,
+        "a restart must not free inputs the planned funding can still spend"
+    );
+
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}

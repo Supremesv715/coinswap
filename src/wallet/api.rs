@@ -1559,6 +1559,18 @@ impl Wallet {
         })
     }
 
+    /// Outpoints still held out of coin selection by a live reservation.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn live_reserved_inputs(&self) -> usize {
+        let now = now_secs();
+        self.store
+            .swap_locks
+            .values()
+            .filter(|l| now.saturating_sub(l.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs())
+            .map(|l| l.outpoints.len())
+            .sum()
+    }
+
     /// Drop reservations past the grace, so an abandoned swap stops holding
     /// liquidity. Returns true when anything was released.
     pub(crate) fn expire_swap_locks(&mut self) -> bool {
