@@ -424,8 +424,20 @@ fn test_payswap_dust_floor_rejects_before_funding() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
 
+    // The default 10_000 sat min_size would refuse the quote before the dust
+    // floor is reached, so this maker advertises a lower one.
+    let fee_overrides = vec![Some(MakerFeeOverride {
+        min_swap_amount: 1_000,
+        ..Default::default()
+    })];
+
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init_with_fee_overrides::<BitcoindBackend>(
+            makers_config_map,
+            fee_overrides,
+            taker_behavior,
+            maker_behaviors,
+        );
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -481,10 +493,10 @@ fn test_payswap_dust_floor_rejects_before_funding() {
                 .with_preferred_makers(vec![maker_address])
                 .with_payment_address(receiver_address.as_unchecked().clone()),
         )
-        .expect_err("a payment below the maker's min_size must be refused at quote time");
+        .expect_err("a payment below the dust floor must be refused at quote time");
     info!("Quote-time refusal: {:?}", dust_err);
     assert!(
-        format!("{dust_err:?}").contains("below maker 0 min_size"),
+        format!("{dust_err:?}").contains("5460 sat minimum for 10 settlement outputs"),
         "unexpected refusal error: {:?}",
         dust_err
     );

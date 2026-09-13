@@ -751,12 +751,25 @@ pub struct TestFramework {
     nostr_relay: Mutex<Option<Child>>,
 }
 
-/// Per-maker offer pricing override for [`TestFramework::init_with_fee_overrides`].
+/// Per-maker offer override for [`TestFramework::init_with_fee_overrides`].
 /// `None` keeps the shared default, so existing tests stay homogeneous.
 #[derive(Clone, Copy, Debug)]
 pub struct MakerFeeOverride {
     pub base_fee: u64,
     pub amount_relative_fee_pct: f64,
+    /// Smallest swap the maker advertises. Lower it to let a test reach a
+    /// guard that the default 10_000 sat floor would otherwise mask.
+    pub min_swap_amount: u64,
+}
+
+impl Default for MakerFeeOverride {
+    fn default() -> Self {
+        Self {
+            base_fee: 500,
+            amount_relative_fee_pct: 0.0025,
+            min_swap_amount: 10_000,
+        }
+    }
 }
 
 impl TestFramework {
@@ -898,7 +911,7 @@ impl TestFramework {
                         base_fee: fee.map_or(500, |f| f.base_fee),
                         amount_relative_fee_pct: fee.map_or(0.0025, |f| f.amount_relative_fee_pct),
                         time_relative_fee_pct: 0.0001,
-                        min_swap_amount: 10_000,
+                        min_swap_amount: fee.map_or(10_000, |f| f.min_swap_amount),
                         required_confirms: 1,
                         supported_protocols: vec![
                             ProtocolVersion::Legacy,
