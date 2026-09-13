@@ -1925,28 +1925,9 @@ impl MakerTrait for MakerServer {
             None
         };
 
-        let mut swaps = lock_debug!(self.ongoing_swaps.lock())?;
-
-        // A resent SwapDetails for a live swap is a reconnect after a dropped
-        // connection: identical parameters just refresh the idle timer, while
-        // different ones must never overwrite the stored swap.
-        if admission && swaps.contains_key(swap_id) {
-            let swap_state = swaps
-                .get_mut(swap_id)
-                .expect("entry exists under this lock");
-            if swap_state.negotiated != NegotiatedTerms::from(state) {
-                log::warn!(
-                    "[{}] Rejecting duplicate SwapDetails for {}: parameters differ from stored swap",
-                    self.config.network_port,
-                    swap_id,
-                );
-                return Err(MakerError::SwapParamMismatch);
-            }
-            swap_state.last_activity = Instant::now();
-            return Ok(());
-        }
-
-        let mut reserved = false;
+        // Reserve and persist before the swap is published. Once it appears in
+        // `ongoing_swaps` another connection can be accepted onto it and reach
+        // funding, so the admission it acts on must already be on disk.
         if let Some(plan) = &planned {
             let inputs: Vec<OutPoint> = plan
                 .iter()
@@ -1969,7 +1950,37 @@ impl MakerTrait for MakerServer {
                 });
             }
             wallet.reserve_swap_locks(swap_id, &inputs);
-            reserved = true;
+            if let Err(e) = wallet.save_to_disk() {
+                wallet.release_swap_locks(swap_id, None);
+                log::error!(
+                    "[{}] Could not persist the reservation for swap {}: {:?}; refusing admission",
+                    self.config.network_port,
+                    swap_id,
+                    e
+                );
+                return Err(MakerError::Wallet(e));
+            }
+        }
+
+        let mut swaps = lock_debug!(self.ongoing_swaps.lock())?;
+
+        // A resent SwapDetails for a live swap is a reconnect after a dropped
+        // connection: identical parameters just refresh the idle timer, while
+        // different ones must never overwrite the stored swap.
+        if admission && swaps.contains_key(swap_id) {
+            let swap_state = swaps
+                .get_mut(swap_id)
+                .expect("entry exists under this lock");
+            if swap_state.negotiated != NegotiatedTerms::from(state) {
+                log::warn!(
+                    "[{}] Rejecting duplicate SwapDetails for {}: parameters differ from stored swap",
+                    self.config.network_port,
+                    swap_id,
+                );
+                return Err(MakerError::SwapParamMismatch);
+            }
+            swap_state.last_activity = Instant::now();
+            return Ok(());
         }
 
         let swap_state = swaps.entry(swap_id.to_string()).or_default();
@@ -2016,34 +2027,6 @@ impl MakerTrait for MakerServer {
             state.outgoing_swapcoins.len()
         );
         drop(swaps);
-
-        // A crash before this write frees inputs the swap may still fund, so
-        // it has to land before the peer is answered — but not under the
-        // swaps lock, which every other handler needs.
-        if reserved {
-            let persisted = lock_debug!(self.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .save_to_disk();
-            if let Err(e) = persisted {
-                // An admission the disk never saw must leave nothing behind:
-                // published state plus a reservation only on this process's
-                // heap would go missing at the next restart. `reserved` is set
-                // only on a first admission, so this entry is ours to drop.
-                lock_debug!(self.ongoing_swaps.lock())
-                    .map_err(|_| MakerError::MutexPossion)?
-                    .remove(swap_id);
-                lock_debug!(self.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                    .release_swap_locks(swap_id, None);
-                log::error!(
-                    "[{}] Could not persist the reservation for swap {}: {:?}; admission undone",
-                    self.config.network_port,
-                    swap_id,
-                    e
-                );
-                return Err(MakerError::Wallet(e));
-            }
-        }
 
         Ok(())
     }
