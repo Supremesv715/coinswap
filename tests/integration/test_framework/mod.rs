@@ -708,9 +708,9 @@ const BLOCKS_PER_TICK: u64 = 5;
 /// outlast the wall-clock recovery delays exercised by the abort tests.
 const BLOCK_TICK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Ask the OS for `n` unused ports, returned ascending. Binding the whole
-/// batch before releasing keeps the ports distinct from each other; the sort
-/// matters because maker port order decides the taker's route order.
+/// Ask the OS for `n` unused ports, sorted as the taker will sort them: maker
+/// addresses order as strings ('127.0.0.1:10000' < '127.0.0.1:9999'), and
+/// that order decides route order and the golden balances.
 fn free_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<TcpListener> = (0..n)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("OS refused a free port"))
@@ -719,7 +719,7 @@ fn free_ports(n: usize) -> Vec<u16> {
         .iter()
         .map(|l| l.local_addr().unwrap().port())
         .collect();
-    ports.sort_unstable();
+    ports.sort_by_key(|port| format!("127.0.0.1:{port}"));
     ports
 }
 

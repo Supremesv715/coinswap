@@ -1856,11 +1856,16 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
             "Incoming count outside the protocol bounds",
         ),
     ];
-    for (behavior, _) in &cases {
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    for (behavior, expected) in &cases {
         taker.behavior = *behavior;
+        let offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
         let error = taker
             .prepare_swap(params())
             .expect_err("the maker's admission guard must refuse the forged SwapDetails");
+        // Each refusal must surface after its own forgery: two cases share a
+        // message, so a whole-log check would let a missing guard pass.
+        wait_for_log_after(&log_path, offset, expected, 1, Duration::from_secs(60));
         info!("forged {:?} refused at admission: {:?}", behavior, error);
     }
     taker.behavior = TakerBehavior::Normal;
@@ -1878,13 +1883,6 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
     maker_threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());
-
-    // Every refusal came from the maker's own admission guard, logged as a
-    // handler error on the dropped connection.
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
-    for (_, expected) in &cases {
-        test_framework.assert_log(expected, &log_path);
-    }
 
     // The maker never reserved or spent anything either.
     makers[0]
@@ -3931,9 +3929,11 @@ fn keepalive_naming_unseen_funding_is_refused() {
     let claim_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
     // The heartbeat's keepalives hit the evidence gate and are refused.
-    wait_for_log(
+    wait_for_log_after(
         &log_path,
+        claim_offset,
         "names funding the backend cannot see",
+        1,
         Duration::from_secs(90),
     );
 

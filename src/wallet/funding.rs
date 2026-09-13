@@ -94,8 +94,23 @@ fn plan_with_k(
         // bigger coin than needed can strand the exact coins a later split
         // must combine to reach its own target.
         let budget = (max_input_budget as usize).min(remaining.len());
-        let mut picked =
-            (1..=budget).find_map(|n| need(n).and_then(|need| smallest_cover(&remaining, n, need)));
+        // The n largest UTXOs bound what any n inputs can cover (the pool is
+        // sorted descending); below `need` the cover search cannot succeed,
+        // so skip its rescan of the pool.
+        let mut top_sum = Vec::with_capacity(remaining.len());
+        let mut sum = 0u64;
+        for (_, value) in &remaining {
+            sum = sum.saturating_add(value.to_sat());
+            top_sum.push(sum);
+        }
+        let mut picked = (1..=budget).find_map(|n| {
+            need(n).and_then(|need| {
+                if top_sum[n - 1] < need {
+                    return None;
+                }
+                smallest_cover(&remaining, n, need)
+            })
+        });
 
         // Over-budget inputs are only acceptable for the 1-split fallback;
         // elsewhere a lower k gets a chance first.
@@ -597,6 +612,21 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
         assert_eq!(plan[0].value.to_sat(), 20_000);
+    }
+
+    #[test]
+    fn infeasible_input_counts_are_skipped_without_changing_the_plan() {
+        // need(1) = 6_065 and need(2) = 6_133 exceed the top-1 (3_000) and
+        // top-2 (6_000) sums, so the search prunes n = 1 and n = 2 — exactly
+        // the counts smallest_cover already proves infeasible — and n = 3
+        // covers need(3) = 6_201.
+        let pool = pool(&[(1, 3_000), (2, 3_000), (3, 3_000)]);
+        assert!(smallest_cover(&pool, 1, 6_065).is_none());
+        assert!(smallest_cover(&pool, 2, 6_133).is_none());
+        let plan = plan_funding_splits(&pool, Amount::from_sat(5_900), 1, 3, 1.0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].utxos.len(), 3);
+        assert_eq!(plan[0].value.to_sat(), 5_900);
     }
 
     #[test]

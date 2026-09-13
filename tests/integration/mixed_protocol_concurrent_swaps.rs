@@ -233,11 +233,7 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         );
         info!(
             "Maker {i} earnings: {}",
-            balances
-                .spendable
-                .checked_sub(*original_balance)
-                .unwrap()
-                .to_sat()
+            balances.spendable.to_sat() as i64 - original_balance.to_sat() as i64
         );
     }
 

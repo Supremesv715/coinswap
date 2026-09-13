@@ -1256,7 +1256,10 @@ impl Taker {
                         .swap_state()
                         .map(|s| s.phase)
                         .unwrap_or(SwapPhase::MakersDiscovered);
-                    if phase >= SwapPhase::FundsBroadcast {
+                    // Same predicate as Legacy: clean up only while the
+                    // broadcast loop was never entered; a swap_state failure
+                    // reads as uncertain, so fail toward recovery.
+                    if !self.no_outgoing_funding_on_chain() {
                         log::warn!("Funds were broadcast, triggering recovery");
                         self.persist_failure(phase, &e);
                         if let Err(re) = self.recover_active_swap() {
@@ -2173,10 +2176,10 @@ impl Taker {
                 swap.params.maker_count,
             )
         };
-        // For the last hop no downstream admission pins the spare's fee, so
-        // capture what the failed maker's stored terms yielded before
+        // For the last hop no downstream admission pins the spare's shape, so
+        // capture what the failed maker's stored terms delivered before
         // overwriting them.
-        let prior_forwardable = self.forwardable_for_hop(target_idx);
+        let prior_delivered = self.derive_next_hop(target_idx).ok().map(|(a, _)| a);
         let protocol = self.swap_state()?.params.protocol;
         let exchange = match protocol {
             ProtocolVersion::Legacy => ExchangeProgress::Legacy(LegacyExchangeProgress::default()),
@@ -2229,19 +2232,14 @@ impl Taker {
             }
         } else {
             // The last hop has no downstream admission to check against, so
-            // compare derived receives instead: the spare must pay at least
-            // what the failed maker's terms yielded, or the swap aborts
-            // rather than silently re-price above the confirmed ceiling.
-            let prior = prior_forwardable.ok_or_else(|| {
+            // compare what the hop actually delivers: forwardable minus the
+            // acked splits' funding fee. A shortfall aborts the swap.
+            let prior = prior_delivered.ok_or_else(|| {
                 TakerError::General(format!(
                     "Maker {target_idx} has no negotiated shape to price the last hop from"
                 ))
             })?;
-            let spare = self.forwardable_for_hop(target_idx).ok_or_else(|| {
-                TakerError::General(format!(
-                    "Spare at hop {target_idx} has no negotiated shape to price the last hop from"
-                ))
-            })?;
+            let spare = self.derive_next_hop(target_idx)?.0;
             if spare < prior {
                 return Err(TakerError::General(format!(
                     "Spare at the last hop forwards {} sats where the failed maker forwarded {} sats; aborting swap",

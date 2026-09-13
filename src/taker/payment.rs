@@ -138,6 +138,27 @@ fn solve_route_gross_sats(
     Ok(required)
 }
 
+/// Dust-floor decision, free of `Taker` so a unit test can drive it; the
+/// method above supplies the quote and split count from the swap state.
+fn check_payment_dust_floor(
+    payment: Option<&PaymentQuote>,
+    tx_count: u32,
+) -> Result<(), TakerError> {
+    let Some(payment) = payment else {
+        return Ok(());
+    };
+    let count = u64::from(tx_count);
+    if payment.amount.to_sat() < MIN_PAYMENT_OUTPUT_SATS * count {
+        return Err(TakerError::General(format!(
+            "Payment amount {} is below the {} sat minimum for {} settlement outputs",
+            payment.amount,
+            MIN_PAYMENT_OUTPUT_SATS * count,
+            count
+        )));
+    }
+    Ok(())
+}
+
 impl Taker {
     /// Validate the receiver address network. Returns the checked address, or
     /// `None` for regular swaps. Runs at the top of `prepare_swap`, before any
@@ -172,19 +193,7 @@ impl Taker {
     /// is unknown until that ack arrives, so the ceiling is what must fit.
     pub(crate) fn payment_check_dust_floor(&self) -> Result<(), TakerError> {
         let swap = self.swap_state()?;
-        let Some(payment) = &swap.payment else {
-            return Ok(());
-        };
-        let count = swap.params.tx_count as u64;
-        if payment.amount.to_sat() < MIN_PAYMENT_OUTPUT_SATS * count {
-            return Err(TakerError::General(format!(
-                "Payment amount {} is below the {} sat minimum for {} settlement outputs",
-                payment.amount,
-                MIN_PAYMENT_OUTPUT_SATS * count,
-                count
-            )));
-        }
-        Ok(())
+        check_payment_dust_floor(swap.payment.as_ref(), swap.params.tx_count)
     }
 
     /// Solve the payment route after maker selection and before negotiation:
@@ -471,5 +480,30 @@ mod tests {
         // the net can never reach the target however large the gross.
         let hop = terms(0, 60.0, 0.5, 100);
         assert!(hop_gross_for_net(&hop, 0, 500_000).is_err());
+    }
+
+    #[test]
+    fn dust_floor_scales_with_the_declared_tx_count() {
+        // The integration test cannot reach this floor (maker min_size beats
+        // 546 sats per output), so drive the decision directly: at tx_count
+        // 10 the receiver amount must cover 10 dust outputs, i.e. 5_460 sats.
+        let address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .assume_checked();
+        let quote = |sats: u64| PaymentQuote {
+            address: address.clone(),
+            amount: Amount::from_sat(sats),
+            settlement_budget: Amount::ZERO,
+            taker_funding_fee_estimate: Amount::ZERO,
+        };
+
+        assert!(check_payment_dust_floor(None, 10).is_ok());
+        assert!(matches!(
+            check_payment_dust_floor(Some(&quote(5_459)), 10),
+            Err(TakerError::General(message)) if message.contains("5460 sat minimum for 10")
+        ));
+        assert!(check_payment_dust_floor(Some(&quote(5_460)), 10).is_ok());
+        assert!(check_payment_dust_floor(Some(&quote(10_000)), 10).is_ok());
     }
 }

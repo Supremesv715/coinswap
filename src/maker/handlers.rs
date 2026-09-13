@@ -302,6 +302,8 @@ pub trait Maker: Send + Sync {
     /// Execute the funding plan frozen at admission, one transaction per
     /// split. `amount` must match the plan's pre-netting total exactly; a
     /// missing or mismatched plan is a protocol error, never a re-plan.
+    /// The `Vec<u32>` is `payment_output_positions`: each split's payment
+    /// output index in its funding tx.
     fn create_funding_transactions(
         &self,
         swap_id: &str,
