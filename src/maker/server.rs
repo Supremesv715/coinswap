@@ -1108,40 +1108,39 @@ fn recover_from_swap(
             .is_some_and(|r| r.funding_broadcast_txids.is_empty());
 
         if never_recorded {
-            // The batch is the maker's own sends: Legacy's funding txs (each
-            // outgoing contract spends one) or Taproot's contract txs.
-            let batch_txids: Vec<_> = outgoing_swapcoins
+            // The maker's own sends: Legacy's funding txs (each outgoing
+            // contract spends one) or Taproot's contract txs. `None` when a
+            // record names none, so it cannot stand as proof of absence.
+            let batch_txids: Option<Vec<_>> = outgoing_swapcoins
                 .iter()
-                .filter_map(|outgoing| match outgoing.protocol {
-                    ProtocolVersion::Legacy => match outgoing.contract_tx.input.first() {
-                        Some(input) => Some(input.previous_output.txid),
-                        // A corrupted persisted record can have empty inputs;
-                        // skip it so one bad record cannot kill recovery.
-                        None => {
-                            log::error!(
-                                "[{}] {:?}",
-                                maker.config.network_port,
-                                MakerError::General(
-                                    "Malformed outgoing swapcoin: contract tx has no inputs"
-                                )
-                            );
-                            None
-                        }
-                    },
+                .map(|outgoing| match outgoing.protocol {
+                    ProtocolVersion::Legacy => outgoing
+                        .contract_tx
+                        .input
+                        .first()
+                        .map(|input| input.previous_output.txid),
                     ProtocolVersion::Taproot => Some(outgoing.contract_tx.compute_txid()),
                 })
                 .collect();
 
             let wallet = lock_debug!(maker.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            let mut all_unknown = true;
-            for txid in &batch_txids {
-                // An error propagates: the records stay and the next recovery
-                // pass asks again, instead of deleting live recovery material.
-                if !wallet.blockchain.is_tx_unknown(txid)? {
-                    all_unknown = false;
-                    break;
+            let mut all_unknown = batch_txids.is_some();
+            if let Some(txids) = &batch_txids {
+                for txid in txids {
+                    // An error propagates: the records stay and the next recovery
+                    // pass asks again, instead of deleting live recovery material.
+                    if !wallet.blockchain.is_tx_unknown(txid)? {
+                        all_unknown = false;
+                        break;
+                    }
                 }
+            } else {
+                log::error!(
+                    "[{}] Malformed outgoing swapcoin for swap {}: contract tx has no inputs; keeping swapcoins for recovery",
+                    maker.config.network_port,
+                    swap_id
+                );
             }
             drop(wallet);
 

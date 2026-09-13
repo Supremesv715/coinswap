@@ -481,7 +481,7 @@ fn test_payswap_dust_floor_rejects_before_funding() {
                 .with_preferred_makers(vec![maker_address])
                 .with_payment_address(receiver_address.as_unchecked().clone()),
         )
-        .expect_err("a payment below the dust-floor ceiling must be refused at quote time");
+        .expect_err("a payment below the maker's min_size must be refused at quote time");
     info!("Quote-time refusal: {:?}", dust_err);
     assert!(
         format!("{dust_err:?}").contains("below maker 0 min_size"),

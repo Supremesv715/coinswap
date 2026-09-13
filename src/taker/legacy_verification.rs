@@ -4,7 +4,11 @@
 //! A malicious maker could send invalid signatures, wrong scripts, or
 //! mismatched hash values — these checks catch all of those.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    thread::sleep,
+    time::Duration,
+};
 
 use bitcoin::{
     hashes::{hash160::Hash as Hash160, Hash},
@@ -27,6 +31,13 @@ use crate::{
 
 use super::{api::Taker, error::TakerError};
 
+/// Prevout lookups before the funding-fee check gives up. A backend blip must
+/// not abort a swap the taker has already funded.
+const MAX_PREVOUT_LOOKUP_ATTEMPTS: u32 = 3;
+
+/// Delay between prevout lookup attempts.
+const PREVOUT_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 impl Taker {
     /// Record a proven maker violation in the offerbook. A persistence
     /// failure is only logged: it must not mask the verification error
@@ -45,7 +56,8 @@ impl Taker {
 
     /// Require every maker funding tx to pay the agreed feerate, derived from
     /// its prevouts and the builder's own convention (`spend_coins`: rate x
-    /// estimated vsize). Backend failure aborts; a shortfall is recorded.
+    /// estimated vsize). Backend failure retries then aborts; a shortfall is
+    /// recorded as a proven violation.
     pub(crate) fn verify_maker_funding_feerate(
         &self,
         funding_txs: &[Transaction],
@@ -60,7 +72,34 @@ impl Taker {
             for input in &tx.input {
                 let prev_outpoint = input.previous_output;
                 if let Entry::Vacant(e) = prev_txs.entry(prev_outpoint.txid) {
-                    let prev_tx = chain.get_raw_transaction(&prev_outpoint.txid, None)?;
+                    // Fail closed: an unverifiable prevout must never skip the
+                    // fee check, but a transient backend error is not the
+                    // maker's fault, so retry before giving up.
+                    let mut fetched = None;
+                    for attempt in 1..=MAX_PREVOUT_LOOKUP_ATTEMPTS {
+                        match chain.get_raw_transaction(&prev_outpoint.txid, None) {
+                            Ok(prev_tx) => {
+                                fetched = Some(prev_tx);
+                                break;
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "Maker {maker_idx} funding tx {i} prevout {} lookup {attempt}/{MAX_PREVOUT_LOOKUP_ATTEMPTS} failed: {err:?}",
+                                    prev_outpoint.txid
+                                );
+                                if attempt < MAX_PREVOUT_LOOKUP_ATTEMPTS {
+                                    sleep(PREVOUT_LOOKUP_RETRY_DELAY);
+                                }
+                            }
+                        }
+                    }
+                    let prev_tx = fetched.ok_or_else(|| {
+                        TakerError::General(format!(
+                            "Maker {maker_idx} funding tx {i} prevout {} is unavailable; \
+                             cannot verify its funding fee",
+                            prev_outpoint.txid
+                        ))
+                    })?;
                     e.insert(prev_tx);
                 }
                 let prevout = prev_txs[&prev_outpoint.txid]

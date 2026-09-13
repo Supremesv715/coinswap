@@ -187,17 +187,21 @@ fn smallest_cover(pool_desc: &[(OutPoint, Amount)], n: usize, need: u64) -> Opti
     // Greedy fill: the largest coin within the remaining deficit, else the
     // smallest coin above it.
     let mut chosen: Vec<usize> = Vec::with_capacity(n);
+    // Membership mask: a linear `chosen.contains` on every candidate makes the
+    // fill quadratic in the pool, and the pool is unbounded for the taker.
+    let mut taken = vec![false; m];
     let mut covered = 0u64;
     for _ in 0..n {
         let pick = (0..m)
-            .filter(|i| !chosen.contains(i))
+            .filter(|i| !taken[*i])
             .find(|i| pool_desc[*i].1.to_sat() <= need - covered)
             .or_else(|| {
                 (0..m)
-                    .filter(|i| !chosen.contains(i))
+                    .filter(|i| !taken[*i])
                     .rfind(|i| pool_desc[*i].1.to_sat() > need - covered)
             })?;
         covered += pool_desc[pick].1.to_sat();
+        taken[pick] = true;
         chosen.push(pick);
         if covered >= need {
             return Some(chosen);
