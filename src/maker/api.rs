@@ -2021,10 +2021,28 @@ impl MakerTrait for MakerServer {
         // it has to land before the peer is answered — but not under the
         // swaps lock, which every other handler needs.
         if reserved {
-            lock_debug!(self.wallet.write())
+            let persisted = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .save_to_disk()
-                .map_err(MakerError::Wallet)?;
+                .save_to_disk();
+            if let Err(e) = persisted {
+                // An admission the disk never saw must leave nothing behind:
+                // published state plus a reservation only on this process's
+                // heap would go missing at the next restart. `reserved` is set
+                // only on a first admission, so this entry is ours to drop.
+                lock_debug!(self.ongoing_swaps.lock())
+                    .map_err(|_| MakerError::MutexPossion)?
+                    .remove(swap_id);
+                lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .release_swap_locks(swap_id, None);
+                log::error!(
+                    "[{}] Could not persist the reservation for swap {}: {:?}; admission undone",
+                    self.config.network_port,
+                    swap_id,
+                    e
+                );
+                return Err(MakerError::Wallet(e));
+            }
         }
 
         Ok(())
