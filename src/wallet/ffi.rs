@@ -178,9 +178,9 @@ impl Wallet {
         // of repairing the caller's rate.
         let fee_rate = match fee_rate {
             Some(rate) if !rate.is_finite() || rate < MIN_RELAY_FEE_RATE => {
-                return Err(WalletError::General(
-                    "fee rate must be finite and at least the 1 sats/vB relay floor".to_string(),
-                ));
+                return Err(WalletError::General(format!(
+                    "fee rate must be finite and at least the {MIN_RELAY_FEE_RATE} sats/vB relay floor"
+                )));
             }
             Some(rate) => rate,
             None => MIN_RELAY_FEE_RATE,

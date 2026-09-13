@@ -91,6 +91,11 @@ pub const MIN_REQUIRED_CONFIRM: u32 = 1;
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
 
+/// Fee rate for our own recovery transactions, shared by both roles.
+/// TODO: read the fee market at recovery time — a live node cannot be
+/// reconfigured mid-swap, and a startup value is stale by then.
+pub const RECOVERY_FEE_RATE: f64 = MIN_RELAY_FEE_RATE;
+
 /// Maximum split count a peer may request. `tx_count` and the per-split input
 /// budget drive peer-controlled allocation and keygen work on both sides;
 /// 10 splits is already economically silly.

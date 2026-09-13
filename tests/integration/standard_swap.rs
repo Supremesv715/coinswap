@@ -469,7 +469,9 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
 
     // The waiting handler kept the swap alive: no idle drain fired.
     let log_contents = fs::read_to_string(&log_path).unwrap();
-    let tail = &log_contents[log_offset as usize..];
+    let tail = log_contents
+        .get(log_offset as usize..)
+        .unwrap_or(log_contents.as_str());
     assert!(
         !tail.contains("Released idle unfunded reservation"),
         "the waiting swap must not be drained as an idle unfunded reservation"

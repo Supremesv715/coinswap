@@ -2645,7 +2645,9 @@ fn run_maker_rejects_replayed_taproot_contract_data<B: TestBackend>() {
     );
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = &contents[log_offset as usize..];
+    let tail = contents
+        .get(log_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert!(
         !tail.contains("Broadcast Taproot contract tx"),
         "the maker must not fund the replayed swap"
@@ -2783,7 +2785,9 @@ fn run_maker_rejects_replayed_legacy_contract_data<B: TestBackend>() {
     );
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = &contents[log_offset as usize..];
+    let tail = contents
+        .get(log_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert!(
         !tail.contains("SECURITY: Broadcasting"),
         "the maker must not fund the replayed swap"
@@ -2911,7 +2915,9 @@ fn run_maker_rejects_replayed_taproot_contract_data_in_flight<B: TestBackend>() 
     );
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = &contents[log_offset as usize..];
+    let tail = contents
+        .get(log_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert!(
         !tail.contains("Taproot contract txid already in use"),
         "the atomic claim must fire before the per-contract seen-check"
@@ -3083,7 +3089,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
         Duration::from_secs(60),
     );
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = &contents[log_offset as usize..];
+    let tail = contents
+        .get(log_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert!(
         !tail.contains("Taproot contract txid already in use"),
         "the per-contract seen-check has nothing to see while swap 1 is unconfirmed"
@@ -3104,7 +3112,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     );
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert_eq!(
-        contents[log_offset as usize..]
+        contents
+            .get(log_offset as usize..)
+            .unwrap_or(contents.as_str())
             .matches("Broadcast Taproot contract tx")
             .count(),
         1,
@@ -3245,7 +3255,9 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
         Duration::from_secs(180),
     );
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = &contents[log_offset as usize..];
+    let tail = contents
+        .get(log_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert_eq!(
         tail.matches("outgoing swapcoins, requesting signatures")
             .count(),
@@ -3607,6 +3619,30 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
     block_generation_handle.join().unwrap();
 }
 
+/// The maker reads this at drain time; the default matches production.
+const LIFETIME_ENV: &str = "OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS";
+
+/// Shrinks the unfunded-swap lifetime for one test and puts the old value back
+/// on drop, so the override cannot leak into later tests in this process.
+struct LifetimeOverride(Option<String>);
+
+impl LifetimeOverride {
+    fn set(secs: &str) -> Self {
+        let previous = std::env::var(LIFETIME_ENV).ok();
+        std::env::set_var(LIFETIME_ENV, secs);
+        Self(previous)
+    }
+}
+
+impl Drop for LifetimeOverride {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var(LIFETIME_ENV, previous),
+            None => std::env::remove_var(LIFETIME_ENV),
+        }
+    }
+}
+
 /// An admitted swap whose funding never shows on-chain must die at its
 /// admission lifetime, no matter how faithfully the taker pings. The test
 /// keeps the reservation warm two ways — a `WaitingFundingConfirmation`
@@ -3617,9 +3653,8 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
 fn unfunded_swap_dies_at_lifetime_despite_keepalives() {
     warn!("Running Test: unfunded swap dies at its admission lifetime despite keepalives");
 
-    // The default test lifetime matches production (two hours); shrink it so
-    // this test does not wait that out. Makers read it at drain time.
-    std::env::set_var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS", "120");
+    // Production waits two hours; this test cannot.
+    let _lifetime = LifetimeOverride::set("120");
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             vec![(9811, Some(21441))],
@@ -3868,8 +3903,8 @@ fn keepalive_with_mempool_funding_still_refreshes() {
 fn keepalive_naming_unseen_funding_is_refused() {
     warn!("Running Test: keepalive naming unseen funding is refused");
 
-    // Same env knob as the lifetime test: shrink the two-hour default.
-    std::env::set_var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS", "120");
+    // Same knob as the lifetime test: shrink the two-hour default.
+    let _lifetime = LifetimeOverride::set("120");
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             vec![(9813, Some(21443))],
@@ -3945,7 +3980,9 @@ fn keepalive_naming_unseen_funding_is_refused() {
         .expect_err("the swap must fail: the maker never answers withheld funding");
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let post_claim = &contents[claim_offset as usize..];
+    let post_claim = contents
+        .get(claim_offset as usize..)
+        .unwrap_or(contents.as_str());
     assert!(
         post_claim.contains("names funding the backend cannot see"),
         "a post-claim keepalive must be refused"

@@ -1000,11 +1000,8 @@ impl Wallet {
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// This recovery pass is wallet-wide; every eligible outgoing swapcoin is considered.
     ///
-    /// `feerate` must be our own estimate, read at recovery time: the peer that
-    /// abandoned the swap must not price our refund, and a rate fixed at startup
-    /// is stale by the time a timelock expires.
-    /// TODO: source it from `FeeEstimator` once that module is usable; every
-    /// caller passes `MIN_RELAY_FEE_RATE` until then.
+    /// `feerate` must be our own: the peer that abandoned the swap does not get
+    /// to price our refund. Callers pass [`crate::utill::RECOVERY_FEE_RATE`].
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,

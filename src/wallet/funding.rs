@@ -72,6 +72,8 @@ fn plan_with_k(
     max_input_budget: u32,
     fee_rate: f64,
 ) -> Option<Vec<SplitPlan>> {
+    // This also floors every split: `(total - assigned) / splits_left` stays at
+    // or above `MIN_SPLIT_SATS` for the whole loop, so no per-split check runs.
     if k == 0 || total < u64::from(k) * MIN_SPLIT_SATS {
         return None;
     }
@@ -137,9 +139,6 @@ fn plan_with_k(
             utxos.push(remaining.remove(pos).0);
         }
 
-        if target < MIN_SPLIT_SATS {
-            return None;
-        }
         plans.push(SplitPlan {
             utxos,
             value: Amount::from_sat(target),

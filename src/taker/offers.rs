@@ -294,11 +294,9 @@ impl OfferBookHandle {
         Ok(())
     }
 
-    /// Record a proven protocol violation: steps the maker down the
-    /// Good -> Unresponsive -> Bad state machine, flags it so a later poll
-    /// success can never return it to selection, and persists the book.
-    /// Only for arithmetically or cryptographically proven misbehavior —
-    /// never timeouts or backend failures, which say nothing about the maker.
+    /// Record a proven protocol violation. The marker is sticky so a later poll
+    /// success cannot return the maker to selection. Only for arithmetically or
+    /// cryptographically proven misbehavior, never timeouts or backend failures.
     pub(crate) fn record_proven_violation(&self, address: &MakerAddress) -> Result<(), TakerError> {
         log::warn!("Proven violation recorded against maker {address}");
         let now_ts = SystemTime::now()

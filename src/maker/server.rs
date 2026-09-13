@@ -17,7 +17,7 @@ use crate::{
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
     protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
-    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE},
+    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, RECOVERY_FEE_RATE},
     wallet::{Blockchain, RecoveryReport, Wallet},
 };
 
@@ -198,14 +198,6 @@ const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30);
 /// Nostr bond re-broadcast interval (production): 30 minutes.
 #[cfg(not(feature = "integration-test"))]
 const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-/// Fee rate for maker recovery transactions, in sats/vB.
-// TODO: read the fee market at recovery time — a live server cannot be
-// reconfigured mid-swap, and a startup value is stale by then. FeeEstimator is
-// unusable as-is (fetches mempool.space/blockstream.info, takes Wallet by value).
-fn recovery_feerate() -> f64 {
-    MIN_RELAY_FEE_RATE
-}
 
 /// Start the maker server.
 pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
@@ -853,7 +845,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         // Redeem any expired bonds
         if let Err(e) = lock_debug!(maker.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .redeem_expired_fidelity_bonds(recovery_feerate(), AddressType::P2TR)
+            .redeem_expired_fidelity_bonds(RECOVERY_FEE_RATE, AddressType::P2TR)
         {
             log::warn!(
                 "[{}] Failed to redeem expired fidelity bonds: {:?}",
@@ -1110,7 +1102,7 @@ fn recover_from_swap(
         if never_recorded {
             // The maker's own sends: Legacy's funding txs (each outgoing
             // contract spends one) or Taproot's contract txs. `None` when a
-            // record names none, so it cannot stand as proof of absence.
+            // Legacy contract tx has no input, so it proves nothing.
             let batch_txids: Option<Vec<_>> = outgoing_swapcoins
                 .iter()
                 .map(|outgoing| match outgoing.protocol {
@@ -1128,11 +1120,26 @@ fn recover_from_swap(
             let mut all_unknown = batch_txids.is_some();
             if let Some(txids) = &batch_txids {
                 for txid in txids {
-                    // An error propagates: the records stay and the next recovery
-                    // pass asks again, instead of deleting live recovery material.
-                    if !wallet.blockchain.is_tx_unknown(txid)? {
-                        all_unknown = false;
-                        break;
+                    // Nothing re-spawns this thread, so a failed query must not
+                    // end recovery. Keep the records and let the monitoring
+                    // loop below retry every heartbeat.
+                    match wallet.blockchain.is_tx_unknown(txid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            all_unknown = false;
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[{}] Could not check funding tx {} for swap {}: {:?}; keeping swapcoins",
+                                maker.config.network_port,
+                                txid,
+                                swap_id,
+                                e
+                            );
+                            all_unknown = false;
+                            break;
+                        }
                     }
                 }
             } else {
@@ -1347,7 +1354,7 @@ fn recover_from_swap(
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
-                recovery_feerate(),
+                RECOVERY_FEE_RATE,
                 &maker.shutdown,
             )
             .map_err(MakerError::Wallet)?;

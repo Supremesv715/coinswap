@@ -18,7 +18,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::{HEART_BEAT_INTERVAL, MIN_RELAY_FEE_RATE},
+    utill::{HEART_BEAT_INTERVAL, RECOVERY_FEE_RATE},
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -30,14 +30,6 @@ use super::swap_tracker::{ContractOutcome, ContractResolution, RecoveryPhase, Sw
 const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(feature = "integration-test")]
 const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Fee rate for taker recovery transactions, in sats/vB.
-// TODO: read the fee market at recovery time — a live node cannot be
-// reconfigured mid-swap, and a startup value is stale by then. FeeEstimator is
-// unusable as-is (fetches mempool.space/blockstream.info, takes Wallet by value).
-fn recovery_feerate() -> f64 {
-    MIN_RELAY_FEE_RATE
-}
 
 /// Background thread that periodically retries wallet-level recovery
 /// (hashlock sweep + timelock recovery) until all contract UTXOs are resolved.
@@ -115,7 +107,7 @@ impl RecoveryLoop {
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        recovery_feerate(),
+                        RECOVERY_FEE_RATE,
                         &shutdown_clone,
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
