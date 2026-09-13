@@ -91,6 +91,21 @@ pub fn restore_wallet_gui_app(
     }
 }
 
+/// The rate a send will actually pay. Below the relay floor the tx would not
+/// propagate, so an unusable rate is refused rather than repaired; an unset one
+/// falls back to the floor. Free of `Wallet` so a unit test can pin both.
+fn checked_fee_rate(fee_rate: Option<f64>) -> Result<f64, WalletError> {
+    match fee_rate {
+        Some(rate) if !rate.is_finite() || rate < MIN_RELAY_FEE_RATE => {
+            Err(WalletError::General(format!(
+                "fee rate must be finite and at least the {MIN_RELAY_FEE_RATE} sats/vB relay floor"
+            )))
+        }
+        Some(rate) => Ok(rate),
+        None => Ok(MIN_RELAY_FEE_RATE),
+    }
+}
+
 impl Wallet {
     /// Creates a wallet backup for GUI/FFI applications.
     ///
@@ -174,17 +189,7 @@ impl Wallet {
             WalletError::General("Invalid address for the current wallet network".to_string())
         })?;
 
-        // Below the relay floor the tx would not propagate; reject instead
-        // of repairing the caller's rate.
-        let fee_rate = match fee_rate {
-            Some(rate) if !rate.is_finite() || rate < MIN_RELAY_FEE_RATE => {
-                return Err(WalletError::General(format!(
-                    "fee rate must be finite and at least the {MIN_RELAY_FEE_RATE} sats/vB relay floor"
-                )));
-            }
-            Some(rate) => rate,
-            None => MIN_RELAY_FEE_RATE,
-        };
+        let fee_rate = checked_fee_rate(fee_rate)?;
 
         let coins_to_spend = self.coin_select(
             amount,
@@ -260,5 +265,14 @@ mod tests {
                 err
             );
         }
+    }
+
+    #[test]
+    fn an_unset_rate_pays_exactly_the_relay_floor() {
+        // Accepting `None` is not enough: a caller that omits the rate must
+        // pay the floor, not whatever a future default happens to be.
+        assert_eq!(checked_fee_rate(None).unwrap(), MIN_RELAY_FEE_RATE);
+        assert_eq!(checked_fee_rate(Some(7.5)).unwrap(), 7.5);
+        assert!(checked_fee_rate(Some(f64::NAN)).is_err());
     }
 }
