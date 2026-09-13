@@ -209,3 +209,56 @@ impl Wallet {
         Ok(txid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::api::test_support::test_wallet;
+    use bitcoin::{
+        secp256k1::{Keypair, Secp256k1, SecretKey},
+        Address, Network,
+    };
+    use bitcoind::tempfile::tempdir;
+
+    /// A Regtest address the wallet accepts, so the fee rate is what decides
+    /// the outcome rather than address parsing.
+    fn destination() -> String {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7u8; 32]).unwrap());
+        Address::p2tr(&secp, keypair.x_only_public_key().0, None, Network::Regtest).to_string()
+    }
+
+    fn send(fee_rate: Option<f64>) -> Result<Txid, WalletError> {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        wallet.send_to_address(10_000, destination(), fee_rate, None)
+    }
+
+    #[test]
+    fn unusable_fee_rates_are_refused() {
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.999] {
+            let err = send(Some(rate)).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("relay floor"),
+                "rate {} must be refused by the relay floor, got {:?}",
+                rate,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_and_the_default_clear_the_rate_check() {
+        // The wallet holds no coins, so each of these fails at coin selection.
+        // The point is that none of them is turned away by the rate check.
+        for rate in [Some(MIN_RELAY_FEE_RATE), Some(5.0), None] {
+            let err = send(rate).unwrap_err();
+            assert!(
+                !format!("{err:?}").contains("relay floor"),
+                "rate {:?} must clear the rate check, got {:?}",
+                rate,
+                err
+            );
+        }
+    }
+}

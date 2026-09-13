@@ -3898,13 +3898,15 @@ mod utxo_corroboration_tests {
     }
 }
 
+/// Fixtures shared by unit tests that never reach the backend.
 #[cfg(test)]
-mod prevout_contract_tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::wallet::blockchain::{BackendConfig, CoreRpcConfig};
-    use bitcoind::tempfile::tempdir;
 
-    fn test_wallet(path: &Path) -> Wallet {
+    /// Regtest wallet with an empty UTXO cache, so coin selection fails
+    /// locally instead of calling out to a node.
+    pub(crate) fn test_wallet(path: &Path) -> Wallet {
         let master_key = Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap();
         let enc_material =
             KeyMaterial::new_from_password(Some("test-password".to_string())).unwrap();
@@ -3932,6 +3934,12 @@ mod prevout_contract_tests {
             restore_scan: false,
         }
     }
+}
+
+#[cfg(test)]
+mod prevout_contract_tests {
+    use super::{test_support::test_wallet, *};
+    use bitcoind::tempfile::tempdir;
 
     #[test]
     fn new_mnemonic_is_yielded_once_then_dropped() {
