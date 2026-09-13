@@ -34,6 +34,9 @@ pub enum MakerBehavior {
     /// Receive contract sigs and save swapcoins, but skip funding broadcast
     /// and close the connection. Simulates last-maker misbehavior.
     SkipFundingBroadcast,
+    /// Like [`MakerBehavior::SkipFundingBroadcast`], but leaves the broadcast
+    /// record empty, so recovery reads the swap as never funded.
+    SkipFundingBroadcastUnrecorded,
     /// Close connection when receiving ReqContractSigsForSender (abort2 scenarios).
     CloseAtReqContractSigsForSender,
     /// Close connection when receiving ProofOfFunding (abort2 scenario).

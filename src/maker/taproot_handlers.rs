@@ -426,15 +426,23 @@ fn process_taproot_contract<M: Maker>(
     #[cfg(feature = "integration-test")]
     {
         use super::handlers::MakerBehavior;
-        if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
+        let skip = matches!(
+            maker.behavior(),
+            MakerBehavior::SkipFundingBroadcast | MakerBehavior::SkipFundingBroadcastUnrecorded
+        );
+        if skip {
             log::warn!(
                 "[{}] Test behavior: skipping Taproot funding broadcast",
                 maker.network_port()
             );
-            state.funding_broadcast_txids = outgoing_swapcoins
-                .iter()
-                .map(|outgoing| outgoing.contract_tx.compute_txid())
-                .collect();
+            // The unrecorded variant leaves the record empty, so recovery sees
+            // the swap as never funded and the discard grace applies.
+            if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
+                state.funding_broadcast_txids = outgoing_swapcoins
+                    .iter()
+                    .map(|outgoing| outgoing.contract_tx.compute_txid())
+                    .collect();
+            }
             state.phase = SwapPhase::AwaitingPrivateKeyHandover;
             for incoming in &incoming_swapcoins {
                 maker.save_incoming_swapcoin(incoming)?;

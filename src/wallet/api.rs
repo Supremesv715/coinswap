@@ -41,8 +41,9 @@ use crate::{
     protocol::contract::create_multisig_redeemscript,
     utill::{
         compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
-        redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
+        now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
         TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
+        UNBROADCAST_DISCARD_GRACE,
     },
 };
 
@@ -113,7 +114,6 @@ pub struct Wallet {
     /// Outpoints promised to one in-flight swap, keyed by swap id. Unlike
     /// `locked_utxos` (a property of the coin), these live and die with the
     /// swap, so one swap's release must never free another's inputs.
-    pub(crate) swap_locks: HashMap<String, HashSet<OutPoint>>,
     /// Transient (never persisted): widens the gap-limit window to
     /// [`RESTORE_ADDRESS_GAP`] while the restore sync runs. Set only by
     /// [`Wallet::restore`].
@@ -468,7 +468,6 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: Some(SecretMnemonic(mnemonic)),
             locked_utxos: HashSet::new(),
-            swap_locks: HashMap::new(),
             restore_scan: false,
         })
     }
@@ -577,7 +576,6 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            swap_locks: HashMap::new(),
             restore_scan: false,
         };
         wallet.seal_master_key()?;
@@ -1515,12 +1513,18 @@ impl Wallet {
     }
 
     /// Reserve `outpoints` for the swap `swap_key`; they stay out of coin
-    /// selection until [`Wallet::release_swap_locks`].
+    /// selection until released, or until the reservation ages out. The
+    /// reservation is persisted, so a restart still honours it.
     pub(crate) fn reserve_swap_locks(&mut self, swap_key: &str, outpoints: &[OutPoint]) {
-        self.swap_locks
+        let entry = self
+            .store
+            .swap_locks
             .entry(swap_key.to_string())
-            .or_default()
-            .extend(outpoints.iter().copied());
+            .or_default();
+        if entry.outpoints.is_empty() {
+            entry.reserved_at = now_secs();
+        }
+        entry.outpoints.extend(outpoints.iter().copied());
     }
 
     /// `Some(inputs)` releases one funding transaction's inputs whose outcome
@@ -1530,24 +1534,40 @@ impl Wallet {
     /// have reached the mempool, and freeing its inputs invites a conflict.
     pub(crate) fn release_swap_locks(&mut self, swap_key: &str, inputs: Option<&[OutPoint]>) {
         let Some(inputs) = inputs else {
-            self.swap_locks.remove(swap_key);
+            self.store.swap_locks.remove(swap_key);
             return;
         };
-        if let Some(locks) = self.swap_locks.get_mut(swap_key) {
+        if let Some(locks) = self.store.swap_locks.get_mut(swap_key) {
             for input in inputs {
-                locks.remove(input);
+                locks.outpoints.remove(input);
             }
-            if locks.is_empty() {
-                self.swap_locks.remove(swap_key);
+            if locks.outpoints.is_empty() {
+                self.store.swap_locks.remove(swap_key);
             }
         }
     }
 
-    /// True while any in-flight swap holds `outpoint` reserved.
+    /// True while an unexpired reservation holds `outpoint`. A reservation
+    /// outlives the taker's connection on purpose: a funding broadcast can
+    /// still arrive, and handing its inputs to another swap invites a
+    /// conflicting transaction. Past the grace the swap is gone for good.
     pub(crate) fn is_swap_reserved(&self, outpoint: &OutPoint) -> bool {
-        self.swap_locks
-            .values()
-            .any(|locks| locks.contains(outpoint))
+        let now = now_secs();
+        self.store.swap_locks.values().any(|locks| {
+            locks.outpoints.contains(outpoint)
+                && now.saturating_sub(locks.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs()
+        })
+    }
+
+    /// Drop reservations past the grace, so an abandoned swap stops holding
+    /// liquidity. Returns true when anything was released.
+    pub(crate) fn expire_swap_locks(&mut self) -> bool {
+        let now = now_secs();
+        let before = self.store.swap_locks.len();
+        self.store
+            .swap_locks
+            .retain(|_, l| now.saturating_sub(l.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs());
+        self.store.swap_locks.len() != before
     }
 
     /// Checks if a UTXO belongs to fidelity bonds, and then returns corresponding UTXOSpendInfo
@@ -2921,7 +2941,8 @@ impl Wallet {
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// `contract_txids` scopes normal settlement to one swap; `None` is reserved
     /// for startup and background recovery across the whole wallet.
-    /// Each coin sweeps at its stored negotiated feerate.
+    /// A PaySwap coin pays the receiver an exact amount, so its fee is whatever
+    /// the input leaves over; every other coin sweeps at its negotiated feerate.
     pub fn sweep_incoming_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -3930,9 +3951,66 @@ pub(crate) mod test_support {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            swap_locks: HashMap::new(),
             restore_scan: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod swap_reservation_tests {
+    use super::{test_support::test_wallet, *};
+    use bitcoin::hashes::Hash as _;
+    use bitcoind::tempfile::tempdir;
+
+    fn outpoint(n: u8) -> OutPoint {
+        OutPoint::new(Txid::from_slice(&[n; 32]).unwrap(), 0)
+    }
+
+    #[test]
+    fn a_reservation_survives_a_wallet_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.cbor");
+        let reserved = outpoint(1);
+
+        {
+            let mut wallet = test_wallet(&path);
+            wallet.reserve_swap_locks("swap-1", &[reserved]);
+            assert!(wallet.is_swap_reserved(&reserved));
+            wallet.save_to_disk().unwrap();
+        }
+
+        // A restarted maker must still refuse these inputs to another swap:
+        // the funding it planned them for can still reach the network.
+        let (store, _) =
+            WalletStore::read_from_disk(&path, Some("test-password".to_string())).unwrap();
+        let locks = store
+            .swap_locks
+            .get("swap-1")
+            .expect("the reservation must outlive the process that took it");
+        assert!(locks.outpoints.contains(&reserved));
+        assert!(!locks.outpoints.contains(&outpoint(2)));
+        assert!(locks.reserved_at > 0, "the lock time must be persisted too");
+    }
+
+    #[test]
+    fn a_reservation_stops_holding_inputs_once_it_ages_out() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        let reserved = outpoint(3);
+        wallet.reserve_swap_locks("swap-2", &[reserved]);
+
+        // Backdate past the grace: an abandoned swap must stop holding liquidity.
+        wallet
+            .store
+            .swap_locks
+            .get_mut("swap-2")
+            .unwrap()
+            .reserved_at -= UNBROADCAST_DISCARD_GRACE.as_secs() + 1;
+
+        assert!(!wallet.is_swap_reserved(&reserved));
+        assert!(wallet.expire_swap_locks());
+        assert!(wallet.store.swap_locks.is_empty());
+        assert!(!wallet.expire_swap_locks(), "expiry must be idempotent");
     }
 }
 
@@ -4156,7 +4234,6 @@ mod restore_history_probe_tests {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            swap_locks: HashMap::new(),
             restore_scan: true,
         }
     }

@@ -167,6 +167,15 @@ impl<'de> Deserialize<'de> for MasterKey {
     }
 }
 
+/// Inputs one swap holds out of coin selection, and when it took them.
+/// Persisted so a restart inside the grace still honours the reservation:
+/// a funding broadcast can still arrive for a swap the process forgot.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SwapReservation {
+    pub(crate) outpoints: HashSet<OutPoint>,
+    pub(crate) reserved_at: u64,
+}
+
 /// Represents the internal data store for a Bitcoin wallet.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WalletStore {
@@ -204,6 +213,9 @@ pub(crate) struct WalletStore {
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
+    /// Swap id to the inputs that swap reserved.
+    #[serde(default)]
+    pub(crate) swap_locks: HashMap<String, SwapReservation>,
 }
 
 impl WalletStore {
@@ -235,6 +247,7 @@ impl WalletStore {
             last_synced_height: None,
             wallet_birthday,
             utxo_cache: HashMap::new(),
+            swap_locks: HashMap::new(),
         };
         store.master_key.seal(store_enc_material)?;
 

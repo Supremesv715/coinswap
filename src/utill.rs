@@ -83,6 +83,15 @@ pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 /// tx parks a swap thread forever and quietly spends the timelock reaction margin.
 pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Grace before a swap with no recorded broadcast may be treated as never
+/// funded. A broadcast that has not reached our backend yet must not read as
+/// absent, so wait out the same window a confirmation is given.
+#[cfg(not(feature = "integration-test"))]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
+/// Shortened so a test can watch the grace expire.
+#[cfg(feature = "integration-test")]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(30);
+
 /// Floor for funding-tx confirmations: applied when the configured
 /// `required_confirms` is absent or 0.
 pub const MIN_REQUIRED_CONFIRM: u32 = 1;
@@ -95,6 +104,14 @@ pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
 /// TODO: read the fee market at recovery time — a live node cannot be
 /// reconfigured mid-swap, and a startup value is stale by then.
 pub const RECOVERY_FEE_RATE: f64 = MIN_RELAY_FEE_RATE;
+
+/// Current time as seconds since UNIX epoch.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Maximum split count a peer may request. `tx_count` and the per-split input
 /// budget drive peer-controlled allocation and keygen work on both sides;

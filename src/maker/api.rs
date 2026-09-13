@@ -1173,13 +1173,18 @@ impl MakerServer {
         }
 
         drop(swaps);
-        // Every drained swap has ended, so its reservation ends with it.
-        // Recovery spends contract outputs, never these inputs.
-        if !drained_ids.is_empty() {
+        // A drained swap keeps its reservation: the taker is gone, but a
+        // funding broadcast may still land, and another swap must not be
+        // handed those inputs. Only age frees them.
+        {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            for id in &drained_ids {
-                wallet.release_swap_locks(id, None);
+            if wallet.expire_swap_locks() {
+                log::info!(
+                    "[{}] Released swap reservations past the grace",
+                    self.config.network_port
+                );
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
             }
         }
 
@@ -1955,6 +1960,9 @@ impl MakerTrait for MakerServer {
                 });
             }
             wallet.reserve_swap_locks(swap_id, &inputs);
+            // Persist before admitting: a crash here must not free inputs the
+            // swap may still fund.
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
 
         let swap_state = swaps.entry(swap_id.to_string()).or_default();

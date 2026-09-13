@@ -9,7 +9,6 @@ use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bitcoin::Txid;
@@ -294,13 +293,7 @@ impl fmt::Display for MakerSwapTracker {
     }
 }
 
-/// Current time as seconds since UNIX epoch.
-pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+pub(crate) use crate::utill::now_secs;
 
 #[cfg(test)]
 mod tests {

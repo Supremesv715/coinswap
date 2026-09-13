@@ -139,6 +139,13 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
+    // Maker2 never broadcast, so its record stays empty. It must not drop the
+    // swapcoins on the first pass — a real broadcast can be in flight but
+    // unseen — so the grace has to be waited out first. Both lines must appear.
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    test_framework.assert_log("shows no funding broadcast after", &log_path);
+    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
+
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {
         maker
@@ -300,7 +307,10 @@ fn test_taproot_timelock_only_recovery() {
 
     let makers_config_map = vec![(16102, Some(19161)), (26102, Some(19162))];
     let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SkipFundingBroadcast];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+    ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
@@ -386,6 +396,13 @@ fn test_taproot_timelock_only_recovery() {
     // 5 blocks/3s; remaining ~105s is scheduling margin.
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
+
+    // Maker2 left its broadcast unrecorded, so recovery must wait out the
+    // grace before dropping the swapcoins rather than trusting one backend
+    // answer. Both lines must appear, in that order.
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    test_framework.assert_log("shows no funding broadcast after", &log_path);
+    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
 
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {
