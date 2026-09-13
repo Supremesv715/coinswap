@@ -88,9 +88,10 @@ pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3600);
 /// absent, so wait out the same window a confirmation is given.
 #[cfg(not(feature = "integration-test"))]
 pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
-/// Shortened so a test can watch the grace expire.
+/// Shortened so a test can watch the grace expire, but longer than a maker
+/// restart takes, so a restart test still sees a live reservation.
 #[cfg(feature = "integration-test")]
-pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(30);
+pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
 
 /// Floor for funding-tx confirmations: applied when the configured
 /// `required_confirms` is absent or 0.

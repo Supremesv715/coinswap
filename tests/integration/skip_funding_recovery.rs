@@ -122,6 +122,23 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
+    // Maker2 planned a funding it never sent. Its swapcoins must still be
+    // there: only the grace may release them, never the failure itself.
+    let victim_held = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert!(
+        victim_held > 0,
+        "Maker2 must keep its swapcoins when the swap fails"
+    );
+
     if stop_watcher {
         assert!(
             makers[0]
@@ -145,6 +162,38 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
     test_framework.assert_log("shows no funding broadcast after", &log_path);
     test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
+
+    // Order matters: the wait has to come before the drop, or the grace did
+    // nothing. And once it expires the swapcoins really are released.
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let waited = log.find("shows no funding broadcast after").unwrap();
+    let dropped = log
+        .find("nothing to recover. Discarding swapcoins.")
+        .unwrap();
+    assert!(
+        waited < dropped,
+        "the maker must wait out the grace before dropping the swapcoins"
+    );
+    makers[1]
+        .wallet
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let victim_after = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert_eq!(
+        victim_after, 0,
+        "Maker2 must release its swapcoins once the grace has run out"
+    );
 
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {
@@ -391,6 +440,23 @@ fn test_taproot_timelock_only_recovery() {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
+    // Maker2 planned a funding it never sent. Its swapcoins must still be
+    // there: only the grace may release them, never the failure itself.
+    let victim_held = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert!(
+        victim_held > 0,
+        "Maker2 must keep its swapcoins when the swap fails"
+    );
+
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
     // 5 blocks/3s; remaining ~105s is scheduling margin.
@@ -403,6 +469,38 @@ fn test_taproot_timelock_only_recovery() {
     let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
     test_framework.assert_log("shows no funding broadcast after", &log_path);
     test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
+
+    // Order matters: the wait has to come before the drop, or the grace did
+    // nothing. And once it expires the swapcoins really are released.
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let waited = log.find("shows no funding broadcast after").unwrap();
+    let dropped = log
+        .find("nothing to recover. Discarding swapcoins.")
+        .unwrap();
+    assert!(
+        waited < dropped,
+        "the maker must wait out the grace before dropping the swapcoins"
+    );
+    makers[1]
+        .wallet
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let victim_after = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert_eq!(
+        victim_after, 0,
+        "Maker2 must release its swapcoins once the grace has run out"
+    );
 
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {

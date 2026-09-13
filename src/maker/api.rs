@@ -1946,6 +1946,7 @@ impl MakerTrait for MakerServer {
             return Ok(());
         }
 
+        let mut reserved = false;
         if let Some(plan) = &planned {
             let inputs: Vec<OutPoint> = plan
                 .iter()
@@ -1968,9 +1969,7 @@ impl MakerTrait for MakerServer {
                 });
             }
             wallet.reserve_swap_locks(swap_id, &inputs);
-            // Persist before admitting: a crash here must not free inputs the
-            // swap may still fund.
-            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+            reserved = true;
         }
 
         let swap_state = swaps.entry(swap_id.to_string()).or_default();
@@ -2016,6 +2015,17 @@ impl MakerTrait for MakerServer {
             state.protocol,
             state.outgoing_swapcoins.len()
         );
+        drop(swaps);
+
+        // A crash before this write frees inputs the swap may still fund, so
+        // it has to land before the peer is answered — but not under the
+        // swaps lock, which every other handler needs.
+        if reserved {
+            lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .save_to_disk()
+                .map_err(MakerError::Wallet)?;
+        }
 
         Ok(())
     }

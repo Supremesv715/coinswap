@@ -698,13 +698,27 @@ fn reservations_survive_a_maker_restart() {
     drop(victim);
     drop(makers);
 
-    let restarted = MakerServer::init(victim_config).unwrap();
+    // Init only reloads state; `start_server` is what runs startup recovery.
+    // The reservation has to survive that too, or a maker could reuse an input
+    // from a funding transaction that can still be broadcast.
+    let restarted = Arc::new(MakerServer::init(victim_config).unwrap());
+    let restarted_thread = {
+        let maker_clone = restarted.clone();
+        thread::spawn(move || {
+            start_server(maker_clone).unwrap();
+        })
+    };
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    thread::sleep(Duration::from_secs(5));
+
     let after = restarted.live_reserved_inputs().unwrap();
     assert_eq!(
         after, before,
-        "a restart must not free inputs the planned funding can still spend"
+        "startup recovery must not free inputs the planned funding can still spend"
     );
 
+    restarted.shutdown.store(true, Relaxed);
+    restarted_thread.join().unwrap();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
