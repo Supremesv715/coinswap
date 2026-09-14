@@ -680,7 +680,7 @@ impl TestFramework {
     /// timelocks can mature during a test.
     #[allow(clippy::type_complexity)]
     pub fn init<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
@@ -777,10 +777,8 @@ impl TestFramework {
             let base_maker_port = 10000 + rand::random::<u16>() % 40000;
 
             // Create the MakerServers with message handling
-            let makers: Vec<Arc<MakerServer>> = makers_config_map
-                .into_iter()
-                .enumerate()
-                .map(|(i, _)| {
+            let makers: Vec<Arc<MakerServer>> = (0..maker_count)
+                .map(|i| {
                     base_rpc_port += 1;
                     let network_port = base_maker_port + i as u16;
                     let maker_id = format!("maker{network_port}");
