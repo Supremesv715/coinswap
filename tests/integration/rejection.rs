@@ -46,12 +46,12 @@ use std::{
 fn test_maker_rejects_out_of_bounds_swap_details() {
     warn!("Running Test: Maker Rejection of SwapDetails + CloseEarly");
 
-    let makers_config_map = vec![(9202, Some(21501)), (19202, Some(21502))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -339,12 +339,12 @@ fn test_low_swap_liquidity() {
     warn!("Running Test: Low Swap Liquidity check");
 
     // Create a maker with normal behaviour
-    let makers_config_map = vec![(8402, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // Initialize test framework
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -452,12 +452,12 @@ fn drain_maker_liquidity_after_fidelity(maker: &Arc<MakerServer>, bitcoind: &bit
 
 #[test]
 fn makers_reject_duplicate_funding_outpoints() {
-    let makers_config_map = vec![(8802, Some(21301)), (18802, Some(21302))];
+    let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::DuplicateFundingOutpoint];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     for taker in &mut takers {
@@ -507,18 +507,12 @@ fn makers_reject_duplicate_funding_outpoints() {
 /// sum, then duplication — so each malice keeps the earlier guards satisfied
 /// to reach its own. One maker is enough: the rejection is the point.
 fn run_legacy_proof_guard(
-    port: u16,
-    rpc: u16,
     behavior: TakerBehavior,
     tx_count: u32,
     expected: &str,
 ) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
-            vec![behavior],
-            vec![MakerBehavior::Normal],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -553,8 +547,6 @@ fn run_legacy_proof_guard(
 #[test]
 fn maker_rejects_overcounted_proof_of_funding() {
     run_legacy_proof_guard(
-        8808,
-        21310,
         TakerBehavior::ExtraFundingTxEntry,
         3,
         "declared incoming count",
@@ -564,8 +556,6 @@ fn maker_rejects_overcounted_proof_of_funding() {
 #[test]
 fn maker_rejects_overstated_proof_of_funding() {
     run_legacy_proof_guard(
-        8810,
-        21311,
         TakerBehavior::OverstatedFundingAmount,
         3,
         "declared swap amount",
@@ -575,8 +565,6 @@ fn maker_rejects_overstated_proof_of_funding() {
 #[test]
 fn maker_rejects_duplicated_funding_outpoint() {
     run_legacy_proof_guard(
-        8812,
-        21312,
         TakerBehavior::DuplicateFundingOutpoint,
         2,
         "Duplicate funding outpoint",
@@ -589,8 +577,6 @@ fn maker_rejects_duplicated_funding_outpoint() {
 #[test]
 fn maker_rejects_underdelivered_legacy_amount() {
     run_legacy_proof_guard(
-        9704,
-        21701,
         TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
         3,
         "declared swap amount",
@@ -625,7 +611,7 @@ fn maker_rejects_wrong_taproot_incoming_count() {
 fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
+            1,
             vec![behavior],
             vec![MakerBehavior::Normal],
         );
@@ -667,7 +653,7 @@ fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, e
 fn one_utxo_taker_completes_degraded_swap() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9710, Some(21704))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -706,12 +692,12 @@ fn one_utxo_taker_completes_degraded_swap() {
 /// its own funding output through the contract path first, then still names that
 /// outpoint in ProofOfFunding. The maker must refuse before funding the next hop.
 fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
-    let makers_config_map = vec![(8804, Some(21303)), (18804, Some(21304))];
+    let maker_count = 2;
     let taker_behaviors = vec![behavior];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     fund_taker_default(&takers[0], bitcoind, 3);
@@ -771,12 +757,12 @@ fn maker_rejects_spent_funding_outpoint_mempool() {
 /// once the re-armed broadcast window expires, not wait forever.
 #[test]
 fn maker_errors_when_seen_funding_tx_is_evicted() {
-    let makers_config_map = vec![(8806, Some(21305)), (18806, Some(21306))];
+    let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -850,12 +836,12 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
 
 #[test]
 fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::SkipSenderContractSigs];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -939,12 +925,12 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
 #[test]
 fn test_taproot_maker_rejects_contract_amount_mismatch() {
     warn!("Running Test: Taproot maker rejects mismatched contract amount");
-    let makers_config_map = vec![(7202, Some(19161)), (17202, Some(19162))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::InvalidTaprootContractAmount];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -989,7 +975,7 @@ fn test_taproot_maker_rejects_contract_amount_mismatch() {
 
 #[test]
 fn test_legacy_taker_rejects_malformed_maker_funding_output() {
-    let makers_config_map = vec![(6102, Some(19051)), (16102, Some(19052))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     // First maker returns Legacy sender contract data whose contract input points
     // at a real funding tx output, but not the advertised 2-of-2 multisig output.
@@ -999,7 +985,7 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1057,10 +1043,10 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
 
 #[test]
 fn test_legacy_taker_rejects_fee_skimming_maker() {
-    let makers_config_map = vec![(6103, Some(19053))];
+    let maker_count = 1;
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::FeeSkimming],
         );
@@ -1092,7 +1078,7 @@ fn test_legacy_taker_rejects_fee_skimming_maker() {
 #[test]
 fn test_taproot_rejects_underfunded_maker_contract() {
     // ---- Setup ----
-    let makers_config_map = vec![(7102, Some(19061))];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // The maker funds a 10k-sat Taproot output but advertises the normal
@@ -1101,7 +1087,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     let maker_behaviors = vec![MakerBehavior::UnderfundTaprootContract];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1166,8 +1152,6 @@ fn test_taproot_rejects_underfunded_maker_contract() {
 #[test]
 fn test_taproot_rejects_fee_skimming_maker() {
     test_taproot_rejection(
-        7103,
-        19062,
         MakerBehavior::FeeSkimming,
         "does not match the negotiated hop total",
     );
@@ -1179,18 +1163,16 @@ fn test_taproot_rejects_fee_skimming_maker() {
 #[test]
 fn taker_rejects_inflated_taproot_contract_amount() {
     test_taproot_rejection(
-        7104,
-        19063,
         MakerBehavior::InflateContractAmount,
         "does not match output value",
     );
 }
 
-fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected_error: &str) {
-    let makers_config_map = vec![(port, Some(rpc))];
+fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
+    let maker_count = 1;
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             vec![TakerBehavior::Normal],
             vec![behavior],
         );
@@ -1238,11 +1220,11 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
 fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     warn!("Running Test: InsufficientLiquidity from active reservation");
 
-    let makers_config_map = vec![(8602, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let maker = &makers[0];
@@ -1313,7 +1295,7 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
 #[test]
 fn taker_rejects_out_of_bounds_params_at_prepare() {
     let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(vec![], vec![TakerBehavior::Normal], vec![]);
+        TestFramework::init::<BitcoindBackend>(0, vec![TakerBehavior::Normal], vec![]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
@@ -1389,7 +1371,7 @@ fn maker_rejects_forged_swap_details_at_admission_electrum() {
 
 fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        vec![(9104, Some(21602))],
+        1,
         vec![TakerBehavior::Normal],
         vec![MakerBehavior::Normal],
     );
@@ -1490,7 +1472,7 @@ fn run_corrupt_contract_response(
 ) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
+            1,
             vec![TakerBehavior::Normal],
             vec![behavior],
         );
@@ -1592,7 +1574,7 @@ fn taker_rejects_duplicated_legacy_contract_outpoint() {
 fn maker_without_fee_headroom_fails_before_any_broadcast() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9110, Some(21605))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -1655,7 +1637,7 @@ fn maker_without_fee_headroom_fails_before_any_broadcast() {
 fn maker_rejects_over_budget_funding_plan() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9116, Some(21608))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -1748,12 +1730,11 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         protocol
     );
 
-    let makers_config_map = vec![(9402, Some(21401))];
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::FailSecondBroadcast];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(1, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1863,12 +1844,11 @@ fn maker_recovers_partial_broadcast_electrum() {
 fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expected_spendable: u64) {
     warn!("Running Test: taker partial funding broadcast, spare maker available");
 
-    let makers_config_map = vec![(9502, Some(21411)), (19502, Some(21412))];
     let taker_behaviors = vec![TakerBehavior::FailSecondFundingBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(2, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -2085,7 +2065,7 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     warn!("Running Test: {}", s.name);
 
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        vec![(s.ports.0, Some(s.ports.1))],
+        1,
         vec![s.behavior],
         vec![MakerBehavior::Normal],
     );
@@ -2316,7 +2296,7 @@ fn concurrent_replay_setup(
 ) {
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(ports.0, Some(ports.1))],
+            1,
             vec![behavior, behavior],
             vec![MakerBehavior::Normal],
         );
@@ -2557,7 +2537,7 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9616, Some(21424))],
+            1,
             vec![TakerBehavior::ResumeAfterMakerDrop],
             vec![MakerBehavior::FailSecondBroadcast],
         );
@@ -2636,7 +2616,7 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
     // swap, so the test can resend the same SwapDetails afterwards.
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9618, Some(21425))],
+            1,
             vec![TakerBehavior::CrashBeforeRecovery],
             vec![MakerBehavior::SkipFundingBroadcast],
         );
@@ -2749,9 +2729,8 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
     port: u16,
     rpc: u16,
 ) {
-    let makers_config_map = vec![(port, Some(rpc))];
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        makers_config_map,
+        1,
         vec![TakerBehavior::Normal],
         vec![MakerBehavior::UnderpayFundingFee],
     );
@@ -2816,7 +2795,7 @@ fn test_legacy_rejects_underreported_funding_inputs() {
 fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16, rpc: u16) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::UnderreportFundingInputs],
         );
@@ -2908,7 +2887,7 @@ fn keepalive_admission(
     let lifetime = lifetime_secs.map(LifetimeOverride::set);
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(port + 11630))],
+            1,
             vec![taker_behavior],
             vec![MakerBehavior::Normal],
         );
@@ -3189,7 +3168,7 @@ fn swap_cap_rejects_before_planning() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9814, Some(21444))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );

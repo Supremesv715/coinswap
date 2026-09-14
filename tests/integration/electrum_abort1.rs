@@ -71,12 +71,12 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     // ---- Setup ----
     warn!("Running Test: Taker Drops After Full Setup (Electrum backend, {protocol:?})");
 
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::DropAfterFundsBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -316,7 +316,7 @@ fn taker_abort_1_legacy_electrum() {
 /// outcome — every incoming coin swept, no hang.
 #[test]
 fn electrum_sweeps_after_breach() {
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -324,7 +324,7 @@ fn electrum_sweeps_after_breach() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<ElectrumBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -441,12 +441,12 @@ fn electrum_sweeps_after_breach() {
 /// spend can be evicted). After the sweep confirms, they are discarded.
 #[test]
 fn electrum_discards_only_on_confirmed_spend() {
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::DropAfterFundsBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<ElectrumBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

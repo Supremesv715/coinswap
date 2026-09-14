@@ -44,7 +44,7 @@ fn spend_once(taker: &Taker, bitcoind: &BitcoinD) -> (bitcoin::Txid, bitcoin::Tr
 
 fn run_rebroadcast_unmined<B: TestBackend>() {
     let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<B>(vec![], vec![TakerBehavior::Normal], vec![]);
+        TestFramework::init::<B>(0, vec![TakerBehavior::Normal], vec![]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
@@ -67,7 +67,7 @@ fn run_rebroadcast_unmined<B: TestBackend>() {
 
 fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
     let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<B>(vec![], vec![TakerBehavior::Normal], vec![]);
+        TestFramework::init::<B>(0, vec![TakerBehavior::Normal], vec![]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 

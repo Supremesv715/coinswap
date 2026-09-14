@@ -44,11 +44,10 @@ fn taproot_populated_blocklist_is_ignored_when_disabled() {
 }
 
 fn run_disabled_blocklist(protocol: ProtocolVersion) {
-    let makers_config_map = vec![(6102, None)];
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(1, taker_behaviors, maker_behaviors);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 

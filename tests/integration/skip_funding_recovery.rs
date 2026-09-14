@@ -37,12 +37,12 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     // ---- Setup ----
     warn!("Running Test: Legacy Timelock-Only Recovery");
 
-    let makers_config_map = vec![(15102, Some(19151)), (25102, Some(19152))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SkipFundingBroadcast];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -314,21 +314,21 @@ pub(crate) fn run_legacy_timelock_recovery_without_watcher() {
 ///    - Maker2 has nothing to recover (outgoing was never broadcast).
 #[test]
 fn test_taproot_timelock_only_recovery() {
-    run_taproot_timelock_only_recovery::<BitcoindBackend>((16102, 19161), (26102, 19162));
+    run_taproot_timelock_only_recovery::<BitcoindBackend>();
 }
 
 /// Same timelock-only recovery on Electrum: the grace and discard decisions
 /// read the indexer rather than the maker's own node.
 #[test]
 fn test_taproot_timelock_only_recovery_electrum() {
-    run_taproot_timelock_only_recovery::<ElectrumBackend>((16103, 19163), (26103, 19164));
+    run_taproot_timelock_only_recovery::<ElectrumBackend>();
 }
 
-fn run_taproot_timelock_only_recovery<B: TestBackend>(maker1: (u16, u16), maker2: (u16, u16)) {
+fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     // ---- Setup ----
     warn!("Running Test: Taproot Timelock-Only Recovery");
 
-    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -336,7 +336,7 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>(maker1: (u16, u16), maker2
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

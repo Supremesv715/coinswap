@@ -21,12 +21,12 @@ fn test_standard_openswap() {
     // ---- Setup ----
     warn!("Running Test: Standard OpenSwap Procedure");
 
-    let makers_config_map = vec![(6102, Some(19051)), (16102, Some(19052))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -275,10 +275,9 @@ fn run_swap_with_custom_feerate(
 ) {
     warn!("Running Test: OpenSwap with a custom feerate");
 
-    let makers_config_map = vec![(port, Some(rpc))];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -365,10 +364,9 @@ fn run_swap_with_custom_feerate(
 fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     warn!("Running Test: maker confirmation wait survives the idle timeout");
 
-    let makers_config_map = vec![(9203, Some(21503))];
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );

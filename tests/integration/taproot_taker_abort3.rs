@@ -39,7 +39,7 @@ fn test_taproot_taker_abort3() {
     run_taproot_taker_abort(
         "close at maker's contract data response",
         TakerBehavior::CloseAtSendersContractFromMaker,
-        vec![(7002, Some(20001)), (17002, Some(20002))],
+        2,
         [14998875, 14999757],
         [882, 0],
         14999118,
@@ -57,7 +57,7 @@ fn test_taproot_taker_abort_after_full_setup() {
     run_taproot_taker_abort(
         "drop after full setup",
         TakerBehavior::BroadcastContractAfterFullSetup,
-        vec![(8502, Some(21101)), (18502, Some(21102))],
+        2,
         [14998875, 14998875],
         [882, 882],
         14499538,
@@ -70,7 +70,7 @@ fn test_taproot_taker_abort_after_full_setup() {
 fn run_taproot_taker_abort(
     case: &str,
     behavior: TakerBehavior,
-    makers_config_map: Vec<(u16, Option<u16>)>,
+    maker_count: usize,
     expected_maker_regular: [u64; 2],
     expected_maker_diff: [u64; 2],
     expected_taker_regular: u64,
@@ -83,7 +83,7 @@ fn run_taproot_taker_abort(
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

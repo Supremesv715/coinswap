@@ -917,11 +917,12 @@ impl TestFramework {
     /// timelocks can mature during a test.
     #[allow(clippy::type_complexity)]
     pub fn init<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        let fee_overrides = vec![None; makers_config_map.len()];
+        let makers_config_map = vec![(0, None); maker_count];
+        let fee_overrides = vec![None; maker_count];
         Self::init_with_settings::<B>(
             makers_config_map,
             fee_overrides,
