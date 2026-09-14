@@ -22,9 +22,6 @@ use super::{
     error::TakerError,
 };
 
-/// Dust floor per settlement output, enforced at quote time.
-const MIN_PAYMENT_OUTPUT_SATS: u64 = 546;
-
 /// PaySwap terms: solved at prepare time, carried in the ongoing swap, and
 /// shown as the cost breakdown in the [`SwapSummary`](super::api::SwapSummary).
 /// The gross route amount is the summary's `send_amount`.
@@ -148,12 +145,14 @@ fn check_payment_dust_floor(
         return Ok(());
     };
     let count = u64::from(tx_count);
-    if payment.amount.to_sat() < MIN_PAYMENT_OUTPUT_SATS * count {
+    let per_output = payment.address.script_pubkey().minimal_non_dust().to_sat();
+    let minimum = per_output
+        .checked_mul(count)
+        .ok_or_else(|| TakerError::General("Payment dust floor overflow".to_string()))?;
+    if payment.amount.to_sat() < minimum {
         return Err(TakerError::General(format!(
             "Payment amount {} is below the {} sat minimum for {} settlement outputs",
-            payment.amount,
-            MIN_PAYMENT_OUTPUT_SATS * count,
-            count
+            payment.amount, minimum, count
         )));
     }
     Ok(())
@@ -308,6 +307,7 @@ impl Taker {
             return Ok(());
         };
         let script_pubkey: ScriptBuf = payment.address.script_pubkey();
+        let minimum_output = script_pubkey.minimal_non_dust().to_sat();
 
         let swap = self.swap_state_mut()?;
         let coin_count = swap.incoming_swapcoins.len() as u64;
@@ -325,7 +325,7 @@ impl Taker {
                     .funding_amount
                     .to_sat()
                     .checked_sub(per_coin_budget)
-                    .filter(|v| *v >= MIN_PAYMENT_OUTPUT_SATS)
+                    .filter(|v| *v >= minimum_output)
                     .ok_or_else(|| {
                         TakerError::General(format!(
                             "Incoming swapcoin funding {} cannot retain the {per_coin_budget} sat \
@@ -354,7 +354,7 @@ impl Taker {
             else {
                 return Err(TakerError::General("No settlement outputs".into()));
             };
-            let reducible = output.saturating_sub(MIN_PAYMENT_OUTPUT_SATS);
+            let reducible = output.saturating_sub(minimum_output);
             if reducible == 0 {
                 return Err(TakerError::General(
                     "Cannot remove the surplus without breaching dust".into(),
@@ -484,9 +484,8 @@ mod tests {
 
     #[test]
     fn dust_floor_scales_with_the_declared_tx_count() {
-        // The integration test cannot reach this floor (maker min_size beats
-        // 546 sats per output), so drive the decision directly: at tx_count
-        // 10 the receiver amount must cover 10 dust outputs, i.e. 5_460 sats.
+        // Drive the decision directly with a P2PKH receiver: at tx_count 10
+        // the amount must cover ten script-derived 546-sat dust outputs.
         let address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()
             .unwrap()
@@ -505,5 +504,23 @@ mod tests {
         ));
         assert!(check_payment_dust_floor(Some(&quote(5_460)), 10).is_ok());
         assert!(check_payment_dust_floor(Some(&quote(10_000)), 10).is_ok());
+    }
+
+    #[test]
+    fn dust_floor_uses_the_receiver_script_type() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let (xonly, _) = keypair.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, bitcoin::Network::Bitcoin);
+        let quote = |sats: u64| PaymentQuote {
+            address: address.clone(),
+            amount: Amount::from_sat(sats),
+            settlement_budget: Amount::ZERO,
+            taker_funding_fee_estimate: Amount::ZERO,
+        };
+
+        assert!(check_payment_dust_floor(Some(&quote(659)), 2).is_err());
+        assert!(check_payment_dust_floor(Some(&quote(660)), 2).is_ok());
     }
 }

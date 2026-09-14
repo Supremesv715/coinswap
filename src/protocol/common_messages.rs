@@ -70,7 +70,8 @@ pub struct Offer {
     pub minimum_locktime: u16,
     /// Maximum swap amount accepted in sats.
     pub max_size: u64,
-    /// Minimum swap amount accepted in sats.
+    /// Operator-selected economic minimum accepted in sats. The dynamic
+    /// protocol floor is derived after the feerate and split count are known.
     pub min_size: u64,
     /// Tweakable public key for receiving swaps.
     /// Actual swap addresses are derived using unique nonces per swap.

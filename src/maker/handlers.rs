@@ -578,7 +578,8 @@ pub struct MakerConfig {
     pub amount_relative_fee_pct: f64,
     /// Time-relative fee percentage.
     pub time_relative_fee_pct: f64,
-    /// Minimum swap amount.
+    /// Operator-selected economic minimum; the derived technical minimum is
+    /// enforced from the negotiated terms at admission.
     pub min_swap_amount: u64,
     /// Maximum swap amount.
     pub max_swap_amount: u64,

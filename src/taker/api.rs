@@ -39,7 +39,7 @@ use crate::{
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
-        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        spendable_output_minimum_sats, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
@@ -1606,6 +1606,7 @@ impl Taker {
             wallet
                 .plan_funding(
                     send_amount,
+                    protocol,
                     tx_count,
                     swap.params.swap_feerate(),
                     // Our own hop pays the fee on top: no input budget, no
@@ -1660,7 +1661,27 @@ impl Taker {
             .ok_or_else(|| {
                 TakerError::General(format!("Maker {i}'s fees exceed the hop amount"))
             })?;
-        Ok((next_amount, swap.makers[i].funding_splits.len() as u32))
+        let split_count = swap.makers[i].funding_splits.len() as u32;
+        if split_count == 0 {
+            return Err(TakerError::General(format!(
+                "Maker {i} reported no funding outputs"
+            )));
+        }
+        let per_output =
+            spendable_output_minimum_sats(swap.makers[i].protocol, swap.params.swap_feerate())
+                .ok_or_else(|| {
+                    TakerError::General("Output minimum arithmetic overflow".to_string())
+                })?;
+        let required = per_output
+            .checked_mul(u64::from(split_count))
+            .ok_or_else(|| TakerError::General("Output minimum arithmetic overflow".to_string()))?;
+        if next_amount.to_sat() < required {
+            return Err(TakerError::General(format!(
+                "Maker {i}'s fees leave {} sats for {split_count} outputs, below the derived {required} sat minimum",
+                next_amount.to_sat()
+            )));
+        }
+        Ok((next_amount, split_count))
     }
 
     /// Walk the route from `start_idx`, declaring `start_amount` and
@@ -1699,8 +1720,12 @@ impl Taker {
 
             match result {
                 Ok(()) => {
+                    // Validate every hop, including the last one: no route is
+                    // prepared when its complete fee schedule leaves outputs
+                    // below the negotiated protocol/rate floor.
+                    let derived = self.derive_next_hop(i)?;
                     if i + 1 < maker_count {
-                        let (amount, count) = self.derive_next_hop(i)?;
+                        let (amount, count) = derived;
                         next_amount = amount;
                         next_count = count;
                     }
@@ -2097,7 +2122,9 @@ impl Taker {
             )));
         }
 
-        // Base fee must not exceed the send amount (that would consume everything)
+        // Reject an obviously confiscatory offer before negotiation. The
+        // complete service, sweep, and funding fee schedule is checked after
+        // each maker reports its actual split shape in `derive_next_hop`.
         if offer.base_fee > send_amount.to_sat() {
             return Err(TakerError::General(format!(
                 "Maker {} offer base_fee ({} sats) exceeds send amount ({} sats)",

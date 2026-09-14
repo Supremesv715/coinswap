@@ -41,9 +41,9 @@ use crate::{
     protocol::contract::create_multisig_redeemscript,
     utill::{
         compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
-        now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
-        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
-        UNBROADCAST_DISCARD_GRACE,
+        now_secs, p2tr_dust_sats, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
+        LEGACY_CONTRACT_SPEND_VSIZE, TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT,
+        TX_CONFIRMATION_TIMEOUT, UNBROADCAST_DISCARD_GRACE,
     },
 };
 
@@ -2741,7 +2741,7 @@ impl Wallet {
                 base_weight,
                 change_weight: change_weight.to_wu(),
                 change_cost: cost_of_change,
-                min_change_value: 330, // P2TR dust threshold (since P2WPKH's 294)
+                min_change_value: p2tr_dust_sats(),
                 excess_strategy: ExcessStrategy::ToChange,
             };
 

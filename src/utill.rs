@@ -170,6 +170,47 @@ pub(crate) const LEGACY_CONTRACT_SPEND_VSIZE: u64 = 150;
 /// key-path: one 64B Schnorr sig, no script (~111)
 pub(crate) const TAPROOT_KEYPATH_VSIZE: u64 = 112;
 
+/// Script template for a swap funding output. Dust depends on the script
+/// class, not on the witness program contents, so an all-zero program gives
+/// the same threshold as the real per-swap script without requiring keys.
+fn swap_output_script(protocol: ProtocolVersion) -> Option<ScriptBuf> {
+    let version = match protocol {
+        ProtocolVersion::Legacy => WitnessVersion::V0,
+        ProtocolVersion::Taproot => WitnessVersion::V1,
+    };
+    WitnessProgram::new(version, &[0; 32])
+        .ok()
+        .map(|program| ScriptBuf::new_witness_program(&program))
+}
+
+/// Smallest useful contract output for a protocol at the negotiated feerate.
+///
+/// The output must itself clear dust and leave a non-dust output after the
+/// maker spends it. The spend model is shared with fee accounting so a rate
+/// change cannot silently leave the swap floor behind.
+pub(crate) fn spendable_output_minimum_sats(
+    protocol: ProtocolVersion,
+    feerate: f64,
+) -> Option<u64> {
+    if !feerate.is_finite() || feerate < MIN_RELAY_FEE_RATE {
+        return None;
+    }
+    let dust = swap_output_script(protocol)?.minimal_non_dust().to_sat();
+    let spend_vsize = match protocol {
+        ProtocolVersion::Legacy => LEGACY_CONTRACT_SPEND_VSIZE,
+        ProtocolVersion::Taproot => TAPROOT_KEYPATH_VSIZE,
+    };
+    fee_at_rate_sats(spend_vsize, feerate)?.checked_add(dust)
+}
+
+/// Dust threshold for the wallet's current P2TR change policy.
+pub(crate) fn p2tr_dust_sats() -> u64 {
+    swap_output_script(ProtocolVersion::Taproot)
+        .expect("a 32-byte v1 witness program is valid")
+        .minimal_non_dust()
+        .to_sat()
+}
+
 /// Vsize model of one forwarding tx: overhead 11 + payment output 43 +
 /// P2TR change 43 + 68 per input. Each leg upper-bounds the wallet's real
 /// P2TR shapes, so the model fee never underprices the real one.
@@ -1285,6 +1326,31 @@ mod tests {
     use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
 
     use super::*;
+
+    #[test]
+    fn spendable_output_floor_tracks_protocol_and_feerate() {
+        assert_eq!(
+            spendable_output_minimum_sats(ProtocolVersion::Legacy, 1.0),
+            Some(480)
+        );
+        assert_eq!(
+            spendable_output_minimum_sats(ProtocolVersion::Taproot, 1.0),
+            Some(442)
+        );
+        assert_eq!(
+            spendable_output_minimum_sats(ProtocolVersion::Legacy, 3.0),
+            Some(780)
+        );
+        assert_eq!(
+            spendable_output_minimum_sats(ProtocolVersion::Taproot, 3.0),
+            Some(666)
+        );
+        assert_eq!(
+            spendable_output_minimum_sats(ProtocolVersion::Taproot, 0.0),
+            None
+        );
+        assert_eq!(p2tr_dust_sats(), 330);
+    }
 
     #[test]
     fn test_send_message() {

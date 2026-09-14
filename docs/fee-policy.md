@@ -132,8 +132,13 @@ The planner works like this:
 - Each split uses the fewest coins that cover it. Ties go to the smallest
   total value. That way an early split never eats coins a later split
   needs.
-- No split may be smaller than 5,000 sats. Below that, the miner fees
-  cost more than the split is worth.
+- Every split must clear a technical floor derived from its contract type
+  and the agreed feerate: the contract output's dust threshold plus the
+  modeled cost to spend it. At 1 sat/vB this is 480 sats for legacy and
+  442 sats for taproot. The floor rises with the feerate.
+- After service, sweep, and funding fees are deducted, every delivered split
+  must still clear that floor. If the requested split count cannot do so, the
+  planner retries with fewer splits; if even one cannot, the swap is refused.
 - Once the maker accepts a swap, it freezes the plan. It reserves the
   chosen coins for that swap, and nothing else can spend them. Funding
   time follows the frozen plan exactly. It never re-plans.
@@ -193,8 +198,8 @@ Here is the flow, step by step:
    claims the maker's coins straight to the receiver's address instead of
    its own. Each incoming coin becomes one output of the payment.
 4. Each output keeps a small reserve for its own claim's miner fee. Every
-   output must stay above the dust limit. That limit is about 546 sats.
-   Bitcoin nodes refuse to forward smaller outputs.
+   output must stay above the dust limit derived from the receiver's address
+   type. Bitcoin nodes refuse to forward smaller outputs.
 5. Makers often come in cheaper than the worst case. That leaves a
    leftover. The leftover cannot go back to you as change. A change
    output would link the payment to your wallet. Your node shaves the
@@ -204,8 +209,9 @@ Here is the flow, step by step:
 6. After shaving, the outputs add up to the requested amount to the sat.
    The receiver sees exactly 50,000 sats arrive.
 
-Two rules follow from this design. Your amount must be at least 546 times
-`tx_count`. That way every output can stay above dust even at the maximum
-split count. A PaySwap also never substitutes a maker mid-route. If a maker
-fails, the payment aborts and your coins come back through recovery. The
-payment never finishes through a different maker at a different price.
+Two rules follow from this design. Your amount must cover one receiver-script
+dust threshold per requested output. That way every output can stay above
+dust even at the maximum split count. A PaySwap also never substitutes a maker
+mid-route. If a maker fails, the payment aborts and your coins come back
+through recovery. The payment never finishes through a different maker at a
+different price.

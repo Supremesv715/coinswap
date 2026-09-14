@@ -157,6 +157,7 @@ impl Taker {
         // budget, no over-budget guard (`None`).
         let plan = wallet.plan_funding(
             send_amount,
+            crate::protocol::ProtocolVersion::Taproot,
             taproot_addresses.len() as u32,
             feerate,
             u32::MAX,

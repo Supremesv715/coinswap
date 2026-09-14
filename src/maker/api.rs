@@ -52,9 +52,6 @@ use super::{
     swap_tracker::MakerSwapTracker,
 };
 
-/// Minimum swap amount in satoshis.
-pub const MIN_SWAP_AMOUNT: u64 = 10_000;
-
 /// Hard lifetime of a swap that has shown no on-chain evidence, counted from
 /// admission. The honest road to first evidence is the taker confirming its own
 /// funding (bounded taker-side by `TX_CONFIRMATION_TIMEOUT`) plus one bounded
@@ -280,18 +277,6 @@ impl MakerServerConfig {
             config_map.get("min_swap_amount"),
             default_config.min_swap_amount,
         );
-        if min_swap_amount < MIN_SWAP_AMOUNT {
-            log::error!(
-                "Configured min_swap_amount {} is below protocol minimum {} sats",
-                min_swap_amount,
-                MIN_SWAP_AMOUNT
-            );
-            return Err(WalletError::InsufficientFund {
-                available: min_swap_amount,
-                required: MIN_SWAP_AMOUNT,
-            });
-        }
-
         let fidelity_feerate = parse_field(
             config_map.get("fidelity_feerate"),
             default_config.fidelity_feerate,
@@ -1261,6 +1246,7 @@ impl MakerServer {
         let mut plan = wallet
             .plan_funding(
                 Amount::from_sat(forwardable),
+                state.protocol,
                 state.tx_count,
                 state.swap_feerate,
                 state.max_input_budget,
@@ -1293,7 +1279,13 @@ impl MakerServer {
             })?;
         // Forwarding nets the taker-reimbursed fee out of each split; a split
         // the netting pushes below the floor is a refusal, not a smaller swap.
-        net_policy_fees(&mut plan, state.max_input_budget, state.swap_feerate).map_err(|e| {
+        net_policy_fees(
+            &mut plan,
+            state.protocol,
+            state.max_input_budget,
+            state.swap_feerate,
+        )
+        .map_err(|e| {
             log::warn!(
                 "[{}] Rejecting swap at admission: policy netting failed: {:?}",
                 self.config.network_port,
@@ -1413,7 +1405,9 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General("Swap feerate below the relay floor"));
         }
 
-        // Check amount is within bounds
+        // The configured minimum is the operator's economic floor. The
+        // protocol/rate/split-dependent technical floor is enforced by the
+        // admission funding plan after the complete terms are known.
         let amount_sat = details.amount.to_sat();
         if amount_sat < config.min_swap_amount {
             return Err(MakerError::General("Swap amount below minimum"));
@@ -2623,6 +2617,25 @@ mod tests {
         assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("3.0"), 3.0);
+    }
+
+    #[test]
+    fn maker_config_accepts_an_economic_floor_below_the_old_literal() {
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 1\n"),
+        )
+        .unwrap();
+
+        let config = MakerServerConfig::new(Some(&path)).unwrap();
+        assert_eq!(config.min_swap_amount, 1);
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.

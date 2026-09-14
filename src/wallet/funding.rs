@@ -9,7 +9,10 @@ use bitcoin::{Address, Amount, OutPoint, Transaction};
 use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry;
 
 use crate::{
-    utill::{fee_at_rate_sats, funding_fee_policy_sats, funding_tx_vsize},
+    protocol::ProtocolVersion,
+    utill::{
+        fee_at_rate_sats, funding_fee_policy_sats, funding_tx_vsize, spendable_output_minimum_sats,
+    },
     wallet::Destination,
 };
 
@@ -23,9 +26,6 @@ pub struct CreateFundingTxesResult {
     pub payment_output_positions: Vec<u32>,
     pub total_miner_fee: u64,
 }
-
-/// A split below this value pays more fee than it is worth.
-const MIN_SPLIT_SATS: u64 = 5000;
 
 /// One planned funding transaction: the UTXOs that fund it and the value it sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,13 +52,23 @@ pub(crate) fn plan_funding_splits(
     max_splits: u32,
     max_input_budget: u32,
     fee_rate: f64,
+    minimum_output_sats: u64,
+    deduct_policy_fee: bool,
 ) -> Vec<SplitPlan> {
     let mut sorted = pool_utxos.to_vec();
     // Ties broken by outpoint so equal-value UTXOs plan identically every time.
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
     for k in (1..=max_splits).rev() {
-        if let Some(plan) = plan_with_k(&sorted, total.to_sat(), k, max_input_budget, fee_rate) {
+        if let Some(plan) = plan_with_k(
+            &sorted,
+            total.to_sat(),
+            k,
+            max_input_budget,
+            fee_rate,
+            minimum_output_sats,
+            deduct_policy_fee,
+        ) {
             return plan;
         }
     }
@@ -71,10 +81,12 @@ fn plan_with_k(
     k: u32,
     max_input_budget: u32,
     fee_rate: f64,
+    minimum_output_sats: u64,
+    deduct_policy_fee: bool,
 ) -> Option<Vec<SplitPlan>> {
     // This also floors every split: `(total - assigned) / splits_left` stays at
-    // or above `MIN_SPLIT_SATS` for the whole loop, so no per-split check runs.
-    if k == 0 || total < u64::from(k) * MIN_SPLIT_SATS {
+    // or above the derived spendable-output minimum for the whole loop.
+    if k == 0 || total < u64::from(k).saturating_mul(minimum_output_sats) {
         return None;
     }
     let mut remaining = pool_desc.to_vec();
@@ -133,6 +145,12 @@ fn plan_with_k(
 
         // Remove highest index first so the lower positions stay valid.
         let mut positions = picked?;
+        if deduct_policy_fee {
+            let policy_fee = funding_fee_policy_sats(positions.len(), max_input_budget, fee_rate)?;
+            if target.checked_sub(policy_fee)? < minimum_output_sats {
+                return None;
+            }
+        }
         positions.sort_unstable();
         let mut utxos = Vec::with_capacity(positions.len());
         for pos in positions.into_iter().rev() {
@@ -247,9 +265,12 @@ fn check_over_budget_spend(
 /// input count. The taker's own hop skips this — its fee rides on top.
 pub fn net_policy_fees(
     plan: &mut [SplitPlan],
+    protocol: ProtocolVersion,
     max_input_budget: u32,
     fee_rate: f64,
 ) -> Result<(), WalletError> {
+    let minimum_output = spendable_output_minimum_sats(protocol, fee_rate)
+        .ok_or_else(|| WalletError::General("output minimum arithmetic overflow".to_string()))?;
     for split in plan.iter_mut() {
         let fee = funding_fee_policy_sats(split.utxos.len(), max_input_budget, fee_rate)
             .ok_or_else(|| WalletError::General("funding fee arithmetic overflow".to_string()))?;
@@ -257,7 +278,7 @@ pub fn net_policy_fees(
             .value
             .to_sat()
             .checked_sub(fee)
-            .filter(|value| *value >= MIN_SPLIT_SATS)
+            .filter(|value| *value >= minimum_output)
             .ok_or_else(|| {
                 WalletError::General("funding fee pushes a split below the minimum".to_string())
             })?;
@@ -278,6 +299,7 @@ fn plan_from_pools(
     max_splits: u32,
     max_input_budget: u32,
     fee_rate: f64,
+    minimum_output_sats: u64,
     swap_fee_sats: Option<u64>,
 ) -> Result<Vec<SplitPlan>, WalletError> {
     let sum =
@@ -285,7 +307,15 @@ fn plan_from_pools(
     let mut guard_error = None;
     for pool in [regular_pool, swap_pool] {
         if sum(pool) >= required {
-            let plan = plan_funding_splits(pool, total, max_splits, max_input_budget, fee_rate);
+            let plan = plan_funding_splits(
+                pool,
+                total,
+                max_splits,
+                max_input_budget,
+                fee_rate,
+                minimum_output_sats,
+                swap_fee_sats.is_some(),
+            );
             if plan.is_empty() {
                 continue;
             }
@@ -327,6 +357,7 @@ impl Wallet {
     pub fn plan_funding(
         &self,
         total: Amount,
+        protocol: ProtocolVersion,
         max_splits: u32,
         fee_rate: f64,
         max_input_budget: u32,
@@ -334,6 +365,10 @@ impl Wallet {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<Vec<SplitPlan>, WalletError> {
+        let minimum_output_sats =
+            spendable_output_minimum_sats(protocol, fee_rate).ok_or_else(|| {
+                WalletError::General("output minimum arithmetic overflow".to_string())
+            })?;
         let locked: HashSet<OutPoint> = self.list_lock_unspent().into_iter().collect();
         let excluded: HashSet<OutPoint> =
             excluded_outpoints.unwrap_or_default().into_iter().collect();
@@ -375,6 +410,7 @@ impl Wallet {
                 max_splits,
                 max_input_budget,
                 fee_rate,
+                minimum_output_sats,
                 swap_fee_sats,
             )?
         } else {
@@ -402,7 +438,15 @@ impl Wallet {
             } else {
                 in_regular
             };
-            let plan = plan_funding_splits(&pool, total, max_splits, max_input_budget, fee_rate);
+            let plan = plan_funding_splits(
+                &pool,
+                total,
+                max_splits,
+                max_input_budget,
+                fee_rate,
+                minimum_output_sats,
+                swap_fee_sats.is_some(),
+            );
             if plan.is_empty() {
                 return Err(WalletError::InsufficientFund {
                     available: pool.iter().map(|(_, amount)| amount.to_sat()).sum(),
@@ -539,6 +583,58 @@ mod tests {
     use super::*;
     use bitcoin::{hashes::Hash, Txid};
 
+    fn plan_funding_splits(
+        pool_utxos: &[(OutPoint, Amount)],
+        total: Amount,
+        max_splits: u32,
+        max_input_budget: u32,
+        fee_rate: f64,
+    ) -> Vec<SplitPlan> {
+        let minimum = spendable_output_minimum_sats(ProtocolVersion::Taproot, fee_rate).unwrap();
+        super::plan_funding_splits(
+            pool_utxos,
+            total,
+            max_splits,
+            max_input_budget,
+            fee_rate,
+            minimum,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_from_pools(
+        regular_pool: &[(OutPoint, Amount)],
+        swap_pool: &[(OutPoint, Amount)],
+        required: u64,
+        total: Amount,
+        max_splits: u32,
+        max_input_budget: u32,
+        fee_rate: f64,
+        swap_fee_sats: Option<u64>,
+    ) -> Result<Vec<SplitPlan>, WalletError> {
+        let minimum = spendable_output_minimum_sats(ProtocolVersion::Taproot, fee_rate).unwrap();
+        super::plan_from_pools(
+            regular_pool,
+            swap_pool,
+            required,
+            total,
+            max_splits,
+            max_input_budget,
+            fee_rate,
+            minimum,
+            swap_fee_sats,
+        )
+    }
+
+    fn net_policy_fees(
+        plan: &mut [SplitPlan],
+        max_input_budget: u32,
+        fee_rate: f64,
+    ) -> Result<(), WalletError> {
+        super::net_policy_fees(plan, ProtocolVersion::Taproot, max_input_budget, fee_rate)
+    }
+
     fn utxo(index: u32, sats: u64) -> (OutPoint, Amount) {
         (
             OutPoint::new(Txid::from_byte_array([index as u8; 32]), index),
@@ -656,10 +752,60 @@ mod tests {
 
     #[test]
     fn split_floor_forces_fewer_splits() {
-        // 2 splits of 9000 sats would sit below the 5000 sat floor each.
-        let plan = plan_funding_splits(&pool(&[(1, 20_000)]), Amount::from_sat(9_000), 2, 2, 1.0);
+        // At 1 sat/vB a spendable Taproot output needs 442 sats, so an
+        // 800-sat total can make one output but not two.
+        let plan = plan_funding_splits(&pool(&[(1, 20_000)]), Amount::from_sat(800), 2, 2, 1.0);
         assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].value.to_sat(), 9_000);
+        assert_eq!(plan[0].value.to_sat(), 800);
+    }
+
+    #[test]
+    fn split_floor_is_derived_for_each_protocol_and_rate() {
+        for (protocol, feerate, per_output) in [
+            (ProtocolVersion::Legacy, 1.0, 480),
+            (ProtocolVersion::Taproot, 1.0, 442),
+            (ProtocolVersion::Legacy, 3.0, 780),
+            (ProtocolVersion::Taproot, 3.0, 666),
+        ] {
+            let pool = pool(&[(1, 100_000), (2, 100_000)]);
+            let below = super::plan_funding_splits(
+                &pool,
+                Amount::from_sat(per_output * 2 - 1),
+                2,
+                1,
+                feerate,
+                spendable_output_minimum_sats(protocol, feerate).unwrap(),
+                false,
+            );
+            let boundary = super::plan_funding_splits(
+                &pool,
+                Amount::from_sat(per_output * 2),
+                2,
+                1,
+                feerate,
+                spendable_output_minimum_sats(protocol, feerate).unwrap(),
+                false,
+            );
+            assert_eq!(below.len(), 1, "{protocol:?} at {feerate} sat/vB");
+            assert_eq!(boundary.len(), 2, "{protocol:?} at {feerate} sat/vB");
+        }
+    }
+
+    #[test]
+    fn policy_netting_retries_with_fewer_splits() {
+        let minimum = spendable_output_minimum_sats(ProtocolVersion::Taproot, 10.0).unwrap();
+        // Two 2,000-sat targets cannot retain the 1,650-sat policy fee and
+        // the 1,450-sat spendable floor. One 4,000-sat target can.
+        let plan = super::plan_funding_splits(
+            &pool(&[(1, 100_000), (2, 100_000)]),
+            Amount::from_sat(4_000),
+            2,
+            1,
+            10.0,
+            minimum,
+            true,
+        );
+        assert_eq!(plan.len(), 1);
     }
 
     #[test]
