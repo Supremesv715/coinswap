@@ -1527,30 +1527,34 @@ impl Wallet {
         entry.outpoints.extend(outpoints.iter().copied());
     }
 
-    /// `Some(inputs)` releases one funding transaction's inputs whose outcome
-    /// is proved (broadcast-accepted or known never sent); `None` drops the
-    /// whole swap's reservation once the swap has ended. Never release a
-    /// batch after an ambiguous broadcast failure — the transaction may still
-    /// have reached the mempool, and freeing its inputs invites a conflict.
-    pub(crate) fn release_swap_locks(&mut self, swap_key: &str, inputs: Option<&[OutPoint]>) {
+    /// `Some(inputs)` frees one funding transaction's inputs once its outcome is
+    /// proved; `None` drops the whole swap's reservation. Never release after an
+    /// ambiguous broadcast failure: the transaction may still reach the mempool.
+    pub(crate) fn release_swap_locks(
+        &mut self,
+        swap_key: &str,
+        inputs: Option<&[OutPoint]>,
+    ) -> bool {
         let Some(inputs) = inputs else {
-            self.store.swap_locks.remove(swap_key);
-            return;
+            return self.store.swap_locks.remove(swap_key).is_some();
         };
-        if let Some(locks) = self.store.swap_locks.get_mut(swap_key) {
-            for input in inputs {
-                locks.outpoints.remove(input);
-            }
-            if locks.outpoints.is_empty() {
-                self.store.swap_locks.remove(swap_key);
-            }
+        let Some(locks) = self.store.swap_locks.get_mut(swap_key) else {
+            return false;
+        };
+        // Not `any`: it short-circuits, leaving the rest of the batch reserved.
+        let mut freed = false;
+        for input in inputs {
+            freed |= locks.outpoints.remove(input);
         }
+        if locks.outpoints.is_empty() {
+            self.store.swap_locks.remove(swap_key);
+        }
+        freed
     }
 
-    /// True while an unexpired reservation holds `outpoint`. A reservation
-    /// outlives the taker's connection on purpose: a funding broadcast can
-    /// still arrive, and handing its inputs to another swap invites a
-    /// conflicting transaction. Past the grace the swap is gone for good.
+    /// True while an unexpired reservation holds `outpoint`. A committed swap's
+    /// reservation outlives the taker's connection on purpose: funding can still
+    /// arrive, and reusing its inputs invites a conflicting transaction.
     pub(crate) fn is_swap_reserved(&self, outpoint: &OutPoint) -> bool {
         let now = now_secs();
         self.store.swap_locks.values().any(|locks| {
@@ -3971,7 +3975,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod swap_reservation_tests {
     use super::{test_support::test_wallet, *};
-    use bitcoin::hashes::Hash as _;
+    use bitcoin::hashes::Hash;
     use bitcoind::tempfile::tempdir;
 
     fn outpoint(n: u8) -> OutPoint {

@@ -1111,7 +1111,7 @@ impl MakerServer {
             })
             .collect();
 
-        let mut drained_ids = Vec::new();
+        let mut unfunded_ids = Vec::new();
         for (id, expired) in released_ids {
             swaps.remove(&id);
             if expired {
@@ -1127,7 +1127,7 @@ impl MakerServer {
                     id
                 );
             }
-            drained_ids.push(id);
+            unfunded_ids.push(id);
         }
 
         // Carries why each swap was drained: an operator reading "dropped connection"
@@ -1160,7 +1160,6 @@ impl MakerServer {
                 );
             }
             if let Some(state) = swaps.remove(&id) {
-                drained_ids.push(id.clone());
                 idle.push(IdleSwapData {
                     swap_id: id,
                     protocol: state.negotiated.protocol,
@@ -1173,17 +1172,24 @@ impl MakerServer {
         }
 
         drop(swaps);
-        // A drained swap keeps its reservation: the taker is gone, but a
-        // funding broadcast may still land, and another swap must not be
-        // handed those inputs. Only age frees them.
+        // An unfunded drain never reached contract data, so this maker will
+        // never fund it and holding its inputs would strand the balance.
+        // A committed swap keeps them: funding may still land, so only age frees those.
         {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let mut freed = false;
+            for id in &unfunded_ids {
+                freed |= wallet.release_swap_locks(id, None);
+            }
             if wallet.expire_swap_locks() {
                 log::info!(
                     "[{}] Released swap reservations past the grace",
                     self.config.network_port
                 );
+                freed = true;
+            }
+            if freed {
                 wallet.save_to_disk().map_err(MakerError::Wallet)?;
             }
         }
