@@ -118,12 +118,8 @@ impl FileRegistry {
     /// Returns all stored maker fidelity records.
     pub fn list_fidelity(&self, height: u32) -> Result<HashSet<Fidelity>, WatcherError> {
         self.with_data(|data| {
-            data.fidelity = data
-                .fidelity
-                .iter()
-                .filter(|v| v.expire_height > height)
-                .cloned()
-                .collect();
+            data.fidelity
+                .retain(|fidelity| fidelity.expire_height > height);
             data.fidelity.clone()
         })
     }

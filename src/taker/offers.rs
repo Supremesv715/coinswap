@@ -6,6 +6,7 @@
 //! It uses asynchronous channels for concurrent processing of maker offers.
 
 use std::{
+    collections::HashMap,
     convert::TryFrom,
     fmt,
     io::BufWriter,
@@ -19,7 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bitcoin::{OutPoint, Txid};
+use bitcoin::OutPoint;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -83,6 +84,11 @@ const DISCOVERY_WAIT_MAX: Duration = Duration::from_secs(10);
 
 const OFFER_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Makers without a successful offer download for this long are removed from
+/// the visible offerbook. Their compact suppression record prevents an
+/// unchanged fidelity announcement from immediately adding them back.
+const STALE_MAKER_AGE: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
 /// Represents an offer along with the corresponding maker address.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferAndAddress {
@@ -106,6 +112,10 @@ pub struct MakerOfferCandidate {
     /// Fidelity bond outpoint (txid from registry, vout is always 0).
     pub fidelity_outpoint: Option<OutPoint>,
 
+    /// Fidelity expiry height, when known from discovery or the downloaded offer.
+    #[serde(default)]
+    pub fidelity_expiry_height: Option<u32>,
+
     /// Latest offer, if successfully fetched
     pub offer: Option<Offer>,
 
@@ -117,6 +127,15 @@ pub struct MakerOfferCandidate {
 
     /// Timestamp(secs) of last successful offer download, used to avoid re-downloading offers too frequently.
     pub last_offer_update_ts: Option<u64>,
+
+    /// Timestamp (secs) when this candidate first entered the offerbook. This
+    /// bounds the lifetime of makers that have never returned a valid offer.
+    #[serde(default)]
+    pub first_seen_ts: Option<u64>,
+
+    /// Whether a local backend failure is awaiting a non-penalizing retry.
+    #[serde(default)]
+    pub backend_retry_pending: bool,
 
     /// Timestamp (secs) after which we will attempt the next offer download, used to back off to makers that are repeatedly unresponsive.
     pub next_offer_check_ts: Option<u64>,
@@ -133,14 +152,17 @@ impl MakerOfferCandidate {
             );
         }
         self.fidelity_outpoint = Some(offer.fidelity.bond.outpoint());
+        self.fidelity_expiry_height = Some(offer.fidelity.bond.lock_time.to_consensus_u32());
         self.offer = Some(offer);
         self.protocol = Some(protocol);
         self.last_offer_update_ts = Some(now_ts);
         self.next_offer_check_ts = None;
+        self.backend_retry_pending = false;
         self.state = MakerState::Good;
     }
 
     fn mark_failure(&mut self, now_ts: u64) {
+        self.backend_retry_pending = false;
         let step_secs = UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs();
         let base = self.next_offer_check_ts.unwrap_or(now_ts).max(now_ts);
         self.next_offer_check_ts = Some(base.saturating_add(step_secs));
@@ -362,7 +384,7 @@ impl OfferBookHandle {
     pub fn load_or_create(data_dir: &Path) -> Result<Self, TakerError> {
         let path = data_dir.join("offerbook.json");
 
-        let offerbook = if path.exists() {
+        let mut offerbook = if path.exists() {
             match OfferBook::read_from_disk(&path) {
                 Ok(book) => {
                     log::info!("Successfully loaded offerbook at {path:?}");
@@ -383,6 +405,16 @@ impl OfferBookHandle {
             serde_json::to_writer_pretty(writer, &empty_book)?;
             empty_book
         };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        if offerbook.backfill_first_seen_timestamps(now) {
+            // Persist the migration immediately so repeated unclean shutdowns
+            // cannot keep resetting the two-day age of legacy candidates.
+            offerbook.write_to_disk(&path)?;
+        }
 
         Ok(Self {
             inner: Arc::new(RwLock::new(offerbook)),
@@ -562,16 +594,36 @@ impl OfferSyncService {
             }
         };
         let fidelities = self.registry.list_fidelity(height)?;
+
         {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+
+            let pruned = book.prune_stale_makers(now);
+            let expired_suppressions = book.prune_expired_suppressions(height);
+            let mut changed = pruned > 0 || expired_suppressions > 0;
+
             for fidelity in fidelities {
                 match MakerAddress::try_from(fidelity.onion_address) {
-                    Ok(parsed) => book.upsert_address(parsed, Some(fidelity.txid)),
+                    Ok(parsed) => {
+                        changed |= book.upsert_discovered(
+                            parsed,
+                            Some(OutPoint::new(fidelity.txid, 0)),
+                            Some(fidelity.expire_height),
+                            now,
+                        );
+                    }
                     Err(e) => {
                         log::warn!("Skipping invalid maker address from registry: {e}");
                     }
                 }
+            }
+
+            if pruned > 0 {
+                log::info!("Pruned {pruned} makers not synced for at least two days");
+            }
+            if changed {
+                book.write_to_disk(&self.offerbook.path)?;
             }
         }
 
@@ -660,15 +712,15 @@ impl OfferSyncService {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        // Ensure the maker is present in the offerbook before polling.
+        // An explicit poll overrides automatic stale-maker suppression.
         // Same poison policy as fetch_and_record_one: skip this poll.
         match lock_debug!(self.offerbook.inner.write()) {
-            Ok(mut book) => book.upsert_address(address.clone(), None),
+            Ok(mut book) => book.upsert_for_poll(address.clone(), now),
             Err(_) => {
                 log::error!("offerbook lock poisoned; skipping poll of {address}");
                 return None;
             }
-        }
+        };
 
         Self::fetch_and_record_one(
             address,
@@ -926,28 +978,191 @@ fn verify_fidelity_with_backend(
     .map_err(|e| FidelityCheckError::BadBond(TakerError::Wallet(e)))
 }
 
-/// An ephemeral Offerbook tracking good and bad makers. Currently, Offerbook is initiated
-/// at the start of every swap. So good and bad maker list will not be persisted.
+/// Minimal record retained after a stale maker is removed from the visible book.
+/// It prevents the unchanged registry record from recreating the maker on every
+/// sync cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SuppressedMaker {
+    fidelity_outpoint: Option<OutPoint>,
+    fidelity_expiry_height: Option<u32>,
+    retry_after_ts: u64,
+}
+
+/// Persisted offerbook containing visible maker candidates and compact stale-maker
+/// suppression records.
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct OfferBook {
     pub(super) makers: Vec<MakerOfferCandidate>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    suppressed_makers: HashMap<MakerAddress, SuppressedMaker>,
 }
 
 impl OfferBook {
-    fn upsert_address(&mut self, address: MakerAddress, txid: Option<Txid>) {
-        if self.makers.iter().any(|m| m.address == address) {
-            return;
+    /// Adds a maker learned through discovery. A different verified bond is
+    /// admitted immediately; otherwise, a suppressed maker receives one recovery
+    /// probe only after its cooldown. Returns whether persisted state changed.
+    fn upsert_discovered(
+        &mut self,
+        address: MakerAddress,
+        fidelity_outpoint: Option<OutPoint>,
+        fidelity_expiry_height: Option<u32>,
+        now_ts: u64,
+    ) -> bool {
+        if let Some(existing) = self.makers.iter_mut().find(|m| m.address == address) {
+            let mut changed = false;
+            if let Some(outpoint) = fidelity_outpoint {
+                if existing.fidelity_outpoint != Some(outpoint) {
+                    existing.fidelity_outpoint = Some(outpoint);
+                    changed = true;
+                }
+            }
+            if let Some(expiry_height) = fidelity_expiry_height {
+                if existing.fidelity_expiry_height != Some(expiry_height) {
+                    existing.fidelity_expiry_height = Some(expiry_height);
+                    changed = true;
+                }
+            }
+            return changed;
         }
 
+        let recovery_probe = match self.suppressed_makers.get(&address) {
+            Some(suppressed) => {
+                let bond_changed = matches!(
+                    (suppressed.fidelity_outpoint, fidelity_outpoint),
+                    (Some(previous), Some(current)) if previous != current
+                );
+                if !bond_changed && now_ts < suppressed.retry_after_ts {
+                    return false;
+                }
+                !bond_changed
+            }
+            None => false,
+        };
+
+        self.suppressed_makers.remove(&address);
+        let first_seen_ts = if recovery_probe {
+            // A recovery attempt gets one probe. If it fails, this deliberately
+            // old timestamp returns it to suppression on the following cycle.
+            now_ts.saturating_sub(STALE_MAKER_AGE.as_secs())
+        } else {
+            now_ts
+        };
+        self.insert_candidate(
+            address,
+            fidelity_outpoint,
+            fidelity_expiry_height,
+            first_seen_ts,
+        );
+        true
+    }
+
+    /// Adds a maker for an explicit user-requested poll, bypassing suppression
+    /// without discarding the evidence needed if the recovery attempt fails.
+    fn upsert_for_poll(&mut self, address: MakerAddress, now_ts: u64) -> bool {
+        let suppressed = self.suppressed_makers.remove(&address);
+        if self.makers.iter().any(|m| m.address == address) {
+            return suppressed.is_some();
+        }
+
+        let (outpoint, expiry_height) = suppressed
+            .map(|maker| (maker.fidelity_outpoint, maker.fidelity_expiry_height))
+            .unwrap_or_default();
+        self.insert_candidate(address, outpoint, expiry_height, now_ts);
+        true
+    }
+
+    fn insert_candidate(
+        &mut self,
+        address: MakerAddress,
+        fidelity_outpoint: Option<OutPoint>,
+        fidelity_expiry_height: Option<u32>,
+        first_seen_ts: u64,
+    ) {
         self.makers.push(MakerOfferCandidate {
             address,
-            fidelity_outpoint: txid.map(|t| OutPoint::new(t, 0)),
+            fidelity_outpoint,
+            fidelity_expiry_height,
             offer: None,
             state: MakerState::Unresponsive { retries: 0 },
             protocol: None,
             last_offer_update_ts: None,
+            first_seen_ts: Some(first_seen_ts),
+            backend_retry_pending: false,
             next_offer_check_ts: None,
         });
+    }
+
+    /// Removes makers whose last successful offer is at least two days old.
+    /// Never-successful makers use their first-seen timestamp as the age anchor.
+    fn prune_stale_makers(&mut self, now_ts: u64) -> usize {
+        let before = self.makers.len();
+        let suppressed_makers = &mut self.suppressed_makers;
+
+        self.makers.retain(|maker| {
+            let age_anchor = maker.last_offer_update_ts.or(maker.first_seen_ts);
+            let stale = !maker.backend_retry_pending
+                && age_anchor.is_some_and(|timestamp| {
+                    now_ts.saturating_sub(timestamp) >= STALE_MAKER_AGE.as_secs()
+                });
+
+            if stale {
+                suppressed_makers.insert(
+                    maker.address.clone(),
+                    SuppressedMaker {
+                        fidelity_outpoint: maker.fidelity_outpoint,
+                        fidelity_expiry_height: maker.fidelity_expiry_height,
+                        retry_after_ts: now_ts.saturating_add(STALE_MAKER_AGE.as_secs()),
+                    },
+                );
+            }
+
+            !stale
+        });
+
+        before - self.makers.len()
+    }
+
+    /// Drops suppression records once their fidelity bond can no longer be a
+    /// discovery source. Records without known expiry remain until retried.
+    fn prune_expired_suppressions(&mut self, current_height: u32) -> usize {
+        if current_height == 0 {
+            return 0;
+        }
+
+        let before = self.suppressed_makers.len();
+        self.suppressed_makers.retain(|_, suppressed| {
+            suppressed
+                .fidelity_expiry_height
+                .is_none_or(|expiry| expiry > current_height)
+        });
+        before - self.suppressed_makers.len()
+    }
+
+    /// Backfills the first-seen timestamp added with stale-maker pruning. For
+    /// old never-successful records, the scheduled retry gives a conservative
+    /// approximation of when the previous attempt occurred.
+    fn backfill_first_seen_timestamps(&mut self, now_ts: u64) -> bool {
+        let mut changed = false;
+        for maker in &mut self.makers {
+            if maker.first_seen_ts.is_some() {
+                continue;
+            }
+
+            let inferred = maker
+                .last_offer_update_ts
+                .or_else(|| {
+                    maker.next_offer_check_ts.map(|next_check| {
+                        next_check
+                            .saturating_sub(UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs())
+                            .min(now_ts)
+                    })
+                })
+                .unwrap_or(now_ts);
+            maker.first_seen_ts = Some(inferred);
+            changed = true;
+        }
+        changed
     }
 
     pub(crate) fn mark_success(
@@ -968,8 +1183,9 @@ impl OfferBook {
         }
     }
 
-    /// Scores a failed fidelity check only when the backend answered. Otherwise
-    /// one local outage walks every honest maker to the terminal `Bad` state.
+    /// Scores a failed fidelity check only when the backend answered. A local
+    /// outage schedules a non-penalizing retry and protects a stale recovery
+    /// candidate from pruning until that retry is attempted.
     fn record_fidelity_failure(
         &mut self,
         address: &MakerAddress,
@@ -982,7 +1198,16 @@ impl OfferBook {
                 self.mark_failure(address, now_ts);
             }
             FidelityCheckError::BackendDown(e) => {
-                log::warn!("Backend failed verifying {address}, leaving its score alone: {e:?}");
+                let retry_at = now_ts.saturating_add(OFFER_SYNC_INTERVAL.as_secs());
+                if let Some(maker) = self
+                    .makers
+                    .iter_mut()
+                    .find(|m| &m.address == address && m.state != MakerState::Bad)
+                {
+                    maker.backend_retry_pending = true;
+                    maker.next_offer_check_ts = Some(retry_at);
+                }
+                log::warn!("Backend failed verifying {address}; retrying at {retry_at}: {e:?}");
             }
         }
     }
@@ -1016,6 +1241,7 @@ impl OfferBook {
                 );
             }
             m.state = MakerState::Bad;
+            m.backend_retry_pending = false;
         }
     }
 
@@ -1346,10 +1572,13 @@ mod tests {
         let mut candidate = MakerOfferCandidate {
             address: addr("6104"),
             fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
+            fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Good,
             protocol: None,
             last_offer_update_ts: None,
+            first_seen_ts: Some(now_ts),
+            backend_retry_pending: false,
             next_offer_check_ts: None,
         };
 
@@ -1386,10 +1615,13 @@ mod tests {
         let mut candidate = MakerOfferCandidate {
             address: addr("6105"),
             fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
+            fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Bad,
             protocol: None,
             last_offer_update_ts: None,
+            first_seen_ts: Some(now_ts),
+            backend_retry_pending: false,
             next_offer_check_ts: Some(now_ts + 123),
         };
 
@@ -1406,14 +1638,17 @@ mod tests {
     #[test]
     fn makers_to_poll_respects_backoff_timer() {
         let now_ts = 170000;
-        let mut book = OfferBook { makers: vec![] };
+        let mut book = OfferBook::default();
         book.makers.push(MakerOfferCandidate {
             address: addr("6103"),
             fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
+            fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Unresponsive { retries: 3 },
             protocol: None,
             last_offer_update_ts: None,
+            first_seen_ts: Some(now_ts),
+            backend_retry_pending: false,
             next_offer_check_ts: Some(now_ts + 10),
         });
 
@@ -1425,32 +1660,216 @@ mod tests {
     }
 
     #[test]
-    fn backend_down_leaves_maker_state_unchanged() {
-        let now_ts = 170000;
-        let address = addr("6106");
-        let mut book = OfferBook { makers: vec![] };
-        book.makers.push(MakerOfferCandidate {
-            address: address.clone(),
-            fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
-            offer: None,
-            state: MakerState::Good,
-            protocol: None,
-            last_offer_update_ts: None,
-            next_offer_check_ts: None,
-        });
+    fn backend_outage_does_not_consume_recovery_probe() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let recovery_ts = prune_ts + ttl;
+        let retry_at = recovery_ts + OFFER_SYNC_INTERVAL.as_secs();
+        let address = addr("backend-retry");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), recovery_ts));
 
         let down = FidelityCheckError::BackendDown(TakerError::General("electrum down".into()));
-        book.record_fidelity_failure(&address, &down, now_ts);
-        assert_eq!(book.makers[0].state, MakerState::Good);
-        assert_eq!(book.makers[0].next_offer_check_ts, None);
+        book.record_fidelity_failure(&address, &down, recovery_ts);
 
-        // A bond the backend did answer on still counts against the maker.
+        assert_eq!(
+            book.makers[0].state,
+            MakerState::Unresponsive { retries: 0 }
+        );
+        assert!(book.makers[0].backend_retry_pending);
+        assert_eq!(book.makers[0].next_offer_check_ts, Some(retry_at));
+        assert_eq!(book.prune_stale_makers(recovery_ts + 1), 0);
+        assert!(book.makers_to_poll(retry_at - 1).is_empty());
+        assert_eq!(book.makers_to_poll(retry_at), vec![address.clone()]);
+
         let bad = FidelityCheckError::BadBond(TakerError::General("bond is spent".into()));
-        book.record_fidelity_failure(&address, &bad, now_ts);
+        book.record_fidelity_failure(&address, &bad, retry_at);
+
+        assert!(!book.makers[0].backend_retry_pending);
         assert_eq!(
             book.makers[0].state,
             MakerState::Unresponsive { retries: 1 }
         );
+        assert_eq!(book.prune_stale_makers(retry_at), 1);
+    }
+
+    #[test]
+    fn stale_pruning_is_inclusive_and_uses_the_right_age_anchor() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let now_ts = ttl * 2;
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0);
+        book.makers[0].last_offer_update_ts = Some(now_ts - ttl + 1);
+
+        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts);
+        book.makers[1].last_offer_update_ts = Some(now_ts - ttl);
+
+        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl);
+
+        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts);
+        book.makers[3].last_offer_update_ts = Some(now_ts + 1);
+
+        assert_eq!(book.prune_stale_makers(now_ts), 2);
+
+        let remaining: Vec<_> = book
+            .makers
+            .iter()
+            .map(|maker| maker.address.clone())
+            .collect();
+        assert_eq!(remaining, vec![addr("fresh"), addr("future")]);
+        assert!(book.suppressed_makers.contains_key(&addr("boundary")));
+        assert!(book.suppressed_makers.contains_key(&addr("never")));
+    }
+
+    #[test]
+    fn same_bond_discovery_cannot_bypass_cooldown() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let address = addr("cached");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+
+        assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), prune_ts + ttl - 1));
+        assert!(book.makers.is_empty());
+
+        let retry_ts = prune_ts + ttl;
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), retry_ts));
+        book.mark_failure(&address, retry_ts);
+        assert_eq!(book.prune_stale_makers(retry_ts), 1);
+    }
+
+    #[test]
+    fn discovery_replaces_rotated_bond_metadata() {
+        let address = addr("rotated");
+        let old_outpoint = Some(OutPoint::new(Txid::from_slice(&[10; 32]).unwrap(), 0));
+        let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[11; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000);
+        assert!(book.upsert_discovered(address, new_outpoint, Some(600), 1_001));
+
+        assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(600));
+    }
+
+    #[test]
+    fn changed_bond_or_manual_poll_bypasses_suppression() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let address = addr("returning");
+        let old_outpoint = Some(OutPoint::new(Txid::from_slice(&[6; 32]).unwrap(), 0));
+        let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[7; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), old_outpoint, Some(500), prune_ts - ttl);
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.upsert_discovered(address.clone(), new_outpoint, Some(600), prune_ts + 1));
+        assert_eq!(book.makers[0].first_seen_ts, Some(prune_ts + 1));
+
+        book.makers[0].first_seen_ts = Some(prune_ts - ttl);
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.upsert_for_poll(address.clone(), prune_ts + 2));
+        assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(600));
+        assert!(!book.suppressed_makers.contains_key(&address));
+    }
+
+    #[test]
+    fn manual_poll_preserves_suppression_evidence() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let poll_ts = prune_ts + 1;
+        let address = addr("manual");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[12; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.upsert_for_poll(address.clone(), poll_ts));
+
+        assert_eq!(book.makers[0].fidelity_outpoint, outpoint);
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(500));
+
+        book.mark_failure(&address, poll_ts);
+        let second_prune_ts = poll_ts + ttl;
+        assert_eq!(book.prune_stale_makers(second_prune_ts), 1);
+
+        let suppressed = &book.suppressed_makers[&address];
+        assert_eq!(suppressed.fidelity_outpoint, outpoint);
+        assert_eq!(suppressed.fidelity_expiry_height, Some(500));
+        assert!(!book.upsert_discovered(address, outpoint, Some(500), second_prune_ts + 1));
+    }
+
+    #[test]
+    fn expired_bond_removes_its_suppression_record() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let now_ts = ttl * 2;
+        let address = addr("expired");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[8; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl);
+        assert_eq!(book.prune_stale_makers(now_ts), 1);
+        assert_eq!(book.prune_expired_suppressions(499), 0);
+        assert_eq!(book.prune_expired_suppressions(500), 1);
+        assert!(!book.suppressed_makers.contains_key(&address));
+    }
+
+    #[test]
+    fn suppression_state_round_trips_and_missing_map_defaults() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let now_ts = ttl * 2;
+        let address = addr("persisted");
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), None, None, now_ts - ttl);
+        assert_eq!(book.prune_stale_makers(now_ts), 1);
+
+        let encoded = serde_json::to_string(&book).unwrap();
+        let decoded: OfferBook = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.suppressed_makers, book.suppressed_makers);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("suppressed_makers");
+        let decoded_legacy: OfferBook = serde_json::from_value(legacy).unwrap();
+        assert!(decoded_legacy.suppressed_makers.is_empty());
+    }
+
+    #[test]
+    fn legacy_candidate_fields_deserialize_and_backfill() {
+        let now_ts = STALE_MAKER_AGE.as_secs();
+        let mut book = OfferBook::default();
+        book.insert_candidate(addr("legacy"), None, None, now_ts);
+
+        let mut encoded = serde_json::to_value(&book).unwrap();
+        let candidate = encoded
+            .get_mut("makers")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|makers| makers.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        candidate.remove("fidelity_expiry_height");
+        candidate.remove("first_seen_ts");
+        candidate.remove("backend_retry_pending");
+        candidate.insert("last_announcement_ts".to_string(), serde_json::json!(100));
+
+        let mut decoded: OfferBook = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.makers[0].fidelity_expiry_height, None);
+        assert_eq!(decoded.makers[0].first_seen_ts, None);
+        assert!(!decoded.makers[0].backend_retry_pending);
+
+        assert!(decoded.backfill_first_seen_timestamps(now_ts));
+        assert_eq!(decoded.makers[0].first_seen_ts, Some(now_ts));
+        assert!(!decoded.backfill_first_seen_timestamps(now_ts + 1));
     }
 
     #[test]
