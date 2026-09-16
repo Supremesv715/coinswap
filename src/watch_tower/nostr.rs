@@ -7,9 +7,10 @@
 use std::{
     borrow::Cow,
     net::TcpStream,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 
@@ -24,7 +25,6 @@ use nostr::{
 use tungstenite::{stream::MaybeTlsStream, Message};
 
 use crate::{
-    lock_debug,
     maker::nostr::{connect_nostr_websocket, swap_kind, EXPIRATION_SECS},
     wallet::{AnyBlockchain, Blockchain},
     watch_tower::{
@@ -38,7 +38,9 @@ use crate::{
 /// clock skew only; anything further would poison the saved cursor.
 const MAX_FUTURE_SKEW_SECS: u64 = 300;
 
-// ## TODO: Instead of looping over relay's have a connection Pool.
+/// Maximum queued Nostr discovery events before relay readers apply backpressure.
+const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
+
 /// Runs the main discovery routine for maker's fidelity bonds by subscribing to network-specific Nostr events.
 /// Blocks until every relay session exits (normally at shutdown).
 pub fn run_discovery(
@@ -58,22 +60,40 @@ pub fn run_discovery(
         relays
     );
 
-    let seen_txid = Arc::new(Mutex::new(SeenTxids::new()));
     let registry = Arc::new(registry);
+    let (event_tx, event_rx) = crossbeam_channel::bounded::<(Arc<str>, RelayMessage<'static>)>(
+        DISCOVERY_EVENT_BUFFER_SIZE,
+    );
 
-    let connections = relays
-        .iter()
-        .map(|_| blockchain.new_connection_with_shutdown(shutdown.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut sessions = Vec::with_capacity(relays.len());
-    for (relay, blockchain) in relays.iter().zip(connections) {
+    let worker_shutdown = shutdown.clone();
+    let worker_registry = Arc::clone(&registry);
+    let worker_initial_sync = initial_sync_complete.clone();
+    let worker_handle = match std::thread::Builder::new()
+        .name("nostr-discovery-processor".to_string())
+        .spawn(move || {
+            run_discovery_event_processor(
+                event_rx,
+                blockchain,
+                worker_registry,
+                kind,
+                worker_shutdown,
+                worker_initial_sync,
+            );
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            shutdown.store(true, Ordering::SeqCst);
+            return Err(e.into());
+        }
+    };
+
+    let mut sessions = Vec::with_capacity(relays.len() + 1);
+    for relay in relays {
         let relay = relay.to_string();
         let session_shutdown = shutdown.clone();
         let registry = Arc::clone(&registry);
-        let blockchain = Arc::new(blockchain);
-        let seen_txid = Arc::clone(&seen_txid);
-        let initial_sync_complete = initial_sync_complete.clone();
         let nostr_tor_config = nostr_tor_config.clone();
+        let session_tx = event_tx.clone();
 
         let handle = match std::thread::Builder::new()
             .name(format!("nostr-session-{}", relay))
@@ -81,23 +101,29 @@ pub fn run_discovery(
                 run_nostr_session_for_relay(
                     &relay,
                     kind,
-                    registry,
+                    &registry,
                     session_shutdown,
-                    blockchain,
-                    &seen_txid,
-                    &initial_sync_complete,
+                    session_tx,
                     (nostr_tor_config.0, nostr_tor_config.1.as_str()),
                 );
             }) {
             Ok(handle) => handle,
             Err(e) => {
                 shutdown.store(true, Ordering::SeqCst);
+                drop(event_tx);
+                sessions.push(worker_handle);
                 join_relay_sessions(sessions);
                 return Err(e.into());
             }
         };
         sessions.push(handle);
     }
+
+    // Drop original sender so the channel disconnects when all relay sessions exit
+    drop(event_tx);
+
+    // Also track the processor worker handle so it is joined at shutdown
+    sessions.push(worker_handle);
 
     // Joining here surfaces a panicked session to the watcher's join,
     // instead of losing it in a detached thread.
@@ -128,30 +154,85 @@ fn join_relay_sessions(sessions: Vec<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Single worker thread consuming Nostr events from all relays over a shared channel.
+/// Uses a single shared blockchain connection to prevent duplicate node/Electrum queries.
+fn run_discovery_event_processor(
+    rx: crossbeam_channel::Receiver<(Arc<str>, RelayMessage<'static>)>,
+    blockchain: AnyBlockchain,
+    registry: Arc<FileRegistry>,
+    kind: Kind,
+    shutdown: Arc<AtomicBool>,
+    initial_sync_complete: Arc<AtomicBool>,
+) {
+    let mut seen_txid = SeenTxids::new();
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let (relay_url, msg) = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(item) => item,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let registry_clone = Arc::clone(&registry);
+        let process_result = catch_unwind(AssertUnwindSafe(|| {
+            handle_relay_message(
+                registry_clone,
+                msg,
+                &blockchain,
+                &relay_url,
+                kind,
+                &mut seen_txid,
+            )
+        }));
+
+        let is_eose = match process_result {
+            Ok(Ok(eose)) => eose,
+            Ok(Err(e)) => {
+                log::warn!("Error processing relay message from {relay_url}: {e:?}");
+                false
+            }
+            Err(panic_err) => {
+                let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    *s
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.as_str()
+                } else {
+                    "unknown panic"
+                };
+                log::error!(
+                    "Recovered from panic while processing Nostr relay message from {relay_url}: {panic_msg}"
+                );
+                false
+            }
+        };
+
+        if is_eose && !initial_sync_complete.load(Ordering::SeqCst) {
+            initial_sync_complete.store(true, Ordering::SeqCst);
+            log::info!("Initial Nostr discovery sync complete (triggered by {relay_url})");
+        }
+    }
+}
+
 /// Runs a long-lived Nostr session for a single relay.
 /// Reconnects automatically until shutdown is requested.
-#[allow(clippy::too_many_arguments)]
 fn run_nostr_session_for_relay(
     relay_url: &str,
     kind: Kind,
-    registry: Arc<FileRegistry>,
+    registry: &Arc<FileRegistry>,
     shutdown: Arc<AtomicBool>,
-    blockchain: Arc<AnyBlockchain>,
-    seen_txid: &Arc<Mutex<SeenTxids>>,
-    initial_sync_complete: &Arc<AtomicBool>,
+    event_tx: crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
     nostr_tor_config: (u16, &str),
 ) {
+    let relay_url_arc: Arc<str> = Arc::from(relay_url);
     log::info!("Starting Nostr session | relay={relay_url}");
 
     while !shutdown.load(Ordering::SeqCst) {
         match connect_and_run_once(
-            relay_url,
+            &relay_url_arc,
             kind,
-            registry.clone(),
+            registry,
             shutdown.clone(),
-            blockchain.clone(),
-            seen_txid,
-            initial_sync_complete,
+            &event_tx,
             nostr_tor_config,
         ) {
             Ok(()) => {
@@ -175,16 +256,13 @@ fn run_nostr_session_for_relay(
     log::info!("Stopped Nostr session | relay={relay_url}");
 }
 
-/// Establishes websocket connection to single Nostr relay and processes events until error or shutdown.
-#[allow(clippy::too_many_arguments)]
+/// Establishes websocket connection to single Nostr relay and streams events into the shared channel.
 fn connect_and_run_once(
-    relay_url: &str,
+    relay_url: &Arc<str>,
     kind: Kind,
-    registry: Arc<FileRegistry>,
+    registry: &Arc<FileRegistry>,
     shutdown: Arc<AtomicBool>,
-    blockchain: Arc<AnyBlockchain>,
-    seen_txid: &Arc<Mutex<SeenTxids>>,
-    initial_sync_complete: &Arc<AtomicBool>,
+    event_tx: &crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
     nostr_tor_config: (u16, &str),
 ) -> Result<(), WatcherError> {
     let mut socket = connect_nostr_websocket(relay_url, nostr_tor_config.0, nostr_tor_config.1)?;
@@ -216,29 +294,15 @@ fn connect_and_run_once(
         req.as_json()
     );
 
-    read_event_loop(
-        registry,
-        socket,
-        shutdown,
-        blockchain,
-        relay_url,
-        kind,
-        seen_txid,
-        initial_sync_complete,
-    )
+    read_event_loop(socket, shutdown, relay_url.clone(), event_tx)
 }
 
-/// Stream all the events from the Nostr relay and deserialize from json until shutdown.
-#[allow(clippy::too_many_arguments)]
+/// Stream all the events from the Nostr relay and send decoded messages into the channel until shutdown.
 fn read_event_loop(
-    registry: Arc<FileRegistry>,
     mut socket: tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
     shutdown: Arc<AtomicBool>,
-    blockchain: Arc<AnyBlockchain>,
-    relay_url: &str,
-    kind: Kind,
-    seen_txid: &Arc<Mutex<SeenTxids>>,
-    initial_sync_complete: &Arc<AtomicBool>,
+    relay_url: Arc<str>,
+    event_tx: &crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
 ) -> Result<(), WatcherError> {
     while !shutdown.load(Ordering::SeqCst) {
         let msg = match socket.read() {
@@ -263,22 +327,21 @@ fn read_event_loop(
         };
 
         // Relays are untrusted; a corrupt frame is skipped, not fatal.
-        let Some(relay_msg) = decode_relay_frame(msg, relay_url) else {
+        let Some(relay_msg) = decode_relay_frame(msg, &relay_url) else {
             continue;
         };
 
-        let is_eose = handle_relay_message(
-            registry.clone(),
-            relay_msg,
-            blockchain.clone(),
-            relay_url,
-            kind,
-            seen_txid,
-        )?;
-
-        if is_eose && !initial_sync_complete.load(Ordering::SeqCst) {
-            initial_sync_complete.store(true, Ordering::SeqCst);
-            log::info!("Initial Nostr discovery sync complete (triggered by {relay_url})");
+        let mut to_send = (relay_url.clone(), relay_msg);
+        while !shutdown.load(Ordering::SeqCst) {
+            match event_tx.send_timeout(to_send, std::time::Duration::from_millis(100)) {
+                Ok(()) => break,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(item)) => {
+                    to_send = item;
+                }
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -327,10 +390,10 @@ fn cursor_for(created_at: u64, now: u64) -> Option<u64> {
 fn handle_relay_message(
     registry: Arc<FileRegistry>,
     msg: RelayMessage,
-    blockchain: Arc<AnyBlockchain>,
+    blockchain: &AnyBlockchain,
     relay_url: &str,
     kind: Kind,
-    seen_txid: &Arc<Mutex<SeenTxids>>,
+    seen_txid: &mut SeenTxids,
 ) -> Result<bool, WatcherError> {
     match msg {
         RelayMessage::Event { event, .. } => {
@@ -401,9 +464,9 @@ fn handle_relay_message(
                 event.created_at
             );
 
-            // Claim the txid before any RPC work, so duplicate events and
-            // concurrent relay sessions don't repeat the fetch and validation.
-            if !lock_debug!(seen_txid.lock())?.claim(txid) {
+            // Claim the txid before any RPC work, so duplicate events across
+            // relays don't repeat the fetch and validation.
+            if !seen_txid.claim(txid) {
                 log::info!("Skipping already-seen txid {txid} via {relay_url}");
                 registry.save_nostr_cursor(relay_url, cursor)?;
                 return Ok(false);
@@ -414,14 +477,14 @@ fn handle_relay_message(
                 Err(e) => {
                     log::warn!("Failed to fetch raw tx {txid:?} via {relay_url}: {e}");
                     // A transient fetch failure leaves the txid eligible for retry.
-                    lock_debug!(seen_txid.lock())?.release(&txid);
+                    seen_txid.release(&txid);
                     return Ok(false);
                 }
             };
 
             // The txid is marked seen once fetched (regardless of validation outcome) so a relay
             // replaying an invalid txid can't force re-validation every time;
-            lock_debug!(seen_txid.lock())?.insert(txid);
+            seen_txid.insert(txid);
             log::info!("Added txid to Nostr discovery cache: {txid}");
 
             match process_fidelity(&tx) {
@@ -454,8 +517,14 @@ fn handle_relay_message(
         }
 
         RelayMessage::EndOfStoredEvents(sub_id) => {
-            log::info!("EOSE received for subscription {sub_id} via {relay_url}");
-            return Ok(true);
+            let expected_sub_id = format!("market-discovery-{}", relay_url);
+            if sub_id.as_str() == expected_sub_id {
+                log::info!("EOSE received for subscription {sub_id} via {relay_url}");
+                return Ok(true);
+            } else {
+                log::debug!("Ignoring EOSE for unrelated subscription {sub_id} via {relay_url}");
+                return Ok(false);
+            }
         }
 
         _ => {}
@@ -467,6 +536,13 @@ fn handle_relay_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::{BackendConfig, CoreRpcConfig};
+    use bitcoin::{hashes::Hash, Txid};
+    use nostr::{
+        event::{EventBuilder, Tag, TagStandard},
+        key::Keys,
+    };
+    use std::str::FromStr;
 
     #[test]
     fn future_dated_event_never_moves_the_cursor() {
@@ -496,14 +572,6 @@ mod tests {
 
     #[test]
     fn tampered_event_is_rejected_before_claiming_txid() {
-        use bitcoin::{hashes::Hash, Txid};
-        use nostr::{
-            event::{EventBuilder, Tag, TagStandard},
-            key::Keys,
-        };
-
-        use crate::wallet::{BackendConfig, CoreRpcConfig};
-
         let kind = Kind::Custom(37_780);
         let txid = Txid::from_slice(&[1; 32]).unwrap();
         let keys = Keys::generate();
@@ -522,21 +590,169 @@ mod tests {
             event: Cow::Owned(event),
         };
         let registry = Arc::new(FileRegistry::new());
-        let blockchain = Arc::new(
-            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap(),
-        );
-        let seen_txid = Arc::new(Mutex::new(SeenTxids::new()));
+        let blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
+        let mut seen_txid = SeenTxids::new();
 
         assert!(!handle_relay_message(
             registry.clone(),
             message,
-            blockchain,
+            &blockchain,
             "wss://relay.example",
             kind,
-            &seen_txid,
+            &mut seen_txid,
         )
         .unwrap());
         assert!(registry.list_fidelity(0).unwrap().is_empty());
-        assert!(seen_txid.lock().unwrap().claim(txid));
+        assert!(seen_txid.claim(txid));
+    }
+
+    #[test]
+    fn duplicate_event_across_relays_skips_blockchain_and_advances_cursor() {
+        let keys = Keys::generate();
+        let kind = Kind::Custom(37778);
+        let now = Timestamp::now().as_secs();
+        let txid_str = "0000000000000000000000000000000000000000000000000000000000000001";
+        let content = format!("{}:0", txid_str);
+
+        let event = EventBuilder::new(kind, content)
+            .tag(Tag::identifier("test-d-tag"))
+            .tag(Tag::from_standardized(TagStandard::Expiration(
+                Timestamp::from_secs(now + 86400),
+            )))
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let registry = Arc::new(FileRegistry::new());
+        let mut seen_txid = SeenTxids::new();
+        let txid = bitcoin::Txid::from_str(txid_str).unwrap();
+
+        // Mark txid as already seen by a previous relay
+        seen_txid.insert(txid);
+
+        let dummy_blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
+
+        let relay_url = "wss://relay2.example";
+        let relay_msg = RelayMessage::Event {
+            subscription_id: Cow::Owned(SubscriptionId::new("sub")),
+            event: Cow::Owned(event),
+        };
+
+        // When relay 2 processes the duplicate, it should return Ok(false) and save cursor without querying the node
+        let result = handle_relay_message(
+            registry.clone(),
+            relay_msg,
+            &dummy_blockchain,
+            relay_url,
+            kind,
+            &mut seen_txid,
+        )
+        .unwrap();
+
+        assert!(!result);
+        assert!(registry.load_nostr_cursor(relay_url).unwrap().is_some());
+    }
+
+    #[test]
+    fn eose_message_returns_true() {
+        let registry = Arc::new(FileRegistry::new());
+        let mut seen_txid = SeenTxids::new();
+        let dummy_blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
+
+        let relay_url = "wss://relay.example";
+
+        // Unrelated subscription returns false
+        let unrelated_msg =
+            RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new("unrelated-sub")));
+        let is_eose_unrelated = handle_relay_message(
+            registry.clone(),
+            unrelated_msg,
+            &dummy_blockchain,
+            relay_url,
+            Kind::Custom(37778),
+            &mut seen_txid,
+        )
+        .unwrap();
+        assert!(!is_eose_unrelated);
+
+        // Matching discovery subscription returns true
+        let matching_sub = format!("market-discovery-{}", relay_url);
+        let matching_msg =
+            RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(matching_sub)));
+        let is_eose_matching = handle_relay_message(
+            registry,
+            matching_msg,
+            &dummy_blockchain,
+            relay_url,
+            Kind::Custom(37778),
+            &mut seen_txid,
+        )
+        .unwrap();
+        assert!(is_eose_matching);
+    }
+
+    #[test]
+    fn worker_handles_eose_and_exits_on_disconnect() {
+        let (event_tx, event_rx) = crossbeam_channel::bounded::<(Arc<str>, RelayMessage<'static>)>(
+            DISCOVERY_EVENT_BUFFER_SIZE,
+        );
+        let dummy_blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
+        let registry = Arc::new(FileRegistry::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let initial_sync_complete = Arc::new(AtomicBool::new(false));
+        let kind = Kind::Custom(37778);
+
+        let worker_shutdown = shutdown.clone();
+        let worker_registry = registry.clone();
+        let worker_initial_sync = initial_sync_complete.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_discovery_event_processor(
+                event_rx,
+                dummy_blockchain,
+                worker_registry,
+                kind,
+                worker_shutdown,
+                worker_initial_sync,
+            );
+        });
+
+        assert!(!initial_sync_complete.load(Ordering::SeqCst));
+
+        // Send an unrelated EOSE message through the channel — flag should NOT flip
+        let relay_url: Arc<str> = Arc::from("wss://relay.example");
+        let unrelated_eose =
+            RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new("sub1")));
+        event_tx.send((relay_url.clone(), unrelated_eose)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!initial_sync_complete.load(Ordering::SeqCst));
+
+        // Send matching discovery EOSE message through the channel
+        let expected_sub = format!("market-discovery-{}", relay_url);
+        let eose_msg =
+            RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(expected_sub)));
+        event_tx.send((relay_url, eose_msg)).unwrap();
+
+        // Wait for worker to process EOSE and flip the flag
+        let mut flipped = false;
+        for _ in 0..40 {
+            if initial_sync_complete.load(Ordering::SeqCst) {
+                flipped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            flipped,
+            "Worker should have marked initial_sync_complete on EOSE"
+        );
+
+        // Drop sender and ensure worker exits cleanly
+        drop(event_tx);
+        assert!(handle.join().is_ok());
     }
 }
