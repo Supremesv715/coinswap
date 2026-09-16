@@ -218,10 +218,7 @@ impl Taker {
         // own outgoing, so we must broadcast first.
         self.swap_state_mut()?.phase = SwapPhase::FundsBroadcast;
         self.persist_swap(SwapPhase::FundsBroadcast)?;
-        // funding_broadcast opens maker 0's connection before the
-        // confirmation wait and keeps the whole route warm with keepalives,
-        // returning the live maker 0 stream for the contract exchange.
-        let maker0_stream = self.funding_broadcast()?;
+        self.funding_broadcast()?;
 
         // Phase 2: Exchange contract data with makers.
         log::info!("Exchanging contract data with makers...");
@@ -230,20 +227,14 @@ impl Taker {
         let hashlock_nonces = self.swap_state()?.hashlock_nonces.clone();
         let mut received_contracts: Vec<TaprootContractData> = Vec::new();
 
-        let mut maker0_stream = Some(maker0_stream);
-
         for i in 0..num_makers {
             let maker_address = self.swap_state()?.makers[i].address.to_string();
-            let mut stream = if i == 0 {
-                // Reuse the warm, already-handshaked connection from funding_broadcast.
-                maker0_stream
-                    .take()
-                    .ok_or_else(|| TakerError::General("Missing warm maker 0 stream".to_string()))?
-            } else {
-                let mut stream = self.net_connect(&maker_address)?;
-                self.net_handshake(&mut stream)?;
-                stream
-            };
+            // Open each protocol connection only when its funding is confirmed.
+            // Hello alone does not identify the swap, so a connection parked
+            // during confirmation can expire under the maker's admission deadline.
+            // The separate route heartbeat keeps swap activity alive while waiting.
+            let mut stream = self.net_connect(&maker_address)?;
+            self.net_handshake(&mut stream)?;
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .connected = true;
@@ -663,10 +654,9 @@ impl Taker {
 
     /// Broadcast contract transactions (Taproot) and wait for them to confirm.
     ///
-    /// Opens maker 0's connection *before* the confirmation wait and keeps the
-    /// route alive with `WaitingFundingConfirmation` keepalives, returning the
-    /// live maker 0 stream so the contract exchange can reuse it.
-    fn funding_broadcast(&mut self) -> Result<std::net::TcpStream, TakerError> {
+    /// The caller's route heartbeat keeps the makers alive during confirmation.
+    /// Protocol connections are opened afterward, immediately before exchange.
+    fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
         let wallet = self.write_wallet()?;
@@ -710,13 +700,6 @@ impl Taker {
             .collect();
         let required_confirms = self.swap_state()?.params.required_confirms;
 
-        // Open and handshake maker 0 up front so its operational connection can
-        // stay warm and be reused after the taker's funding confirms.
-        let swap_id = self.swap_state()?.id.clone();
-        let maker0_address = self.swap_state()?.makers[0].address.to_string();
-        let mut stream = self.net_connect(&maker0_address)?;
-        self.net_handshake(&mut stream)?;
-
         self.wait_for_funding_confirmation(
             &contract_txids,
             required_confirms,
@@ -726,12 +709,12 @@ impl Taker {
         #[cfg(debug_assertions)]
         log::debug!(
            "[FUNDING_STATE] Source: taker::taproot_swap::funding_broadcast | SwapID: {} | Protocol: Taproot | ContractTxs: {} | RequiredConfirms: {} | Status: confirmed",
-            swap_id,
+            self.swap_state()?.id,
             contract_txids.len(),
             required_confirms
         );
         log::info!("Contract transactions broadcast and confirmed");
-        Ok(stream)
+        Ok(())
     }
 
     /// Wait for contract (funding) txs to reach `required_confirms`.

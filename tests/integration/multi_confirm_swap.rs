@@ -1,14 +1,14 @@
-//! Swaps that wait for more than one funding confirmation.
+//! Swaps with funding confirmation waits.
 //!
-//! Every other test passes `with_required_confirms(1)`, so the confirmation-wait
-//! loop and the `WaitingFundingConfirmation` keepalive never run. Without the
-//! keepalive a maker would mistake a long funding wait for a dropped taker and
-//! start recovering contracts mid-swap.
+//! Exercise both multiple confirmations and a first confirmation delayed beyond
+//! the maker admission deadline. Route heartbeats must preserve swap activity
+//! throughout these waits, and protocol sockets must not expire before use.
 //!
 //! Both protocols are covered: the wait sites differ (`legacy_swap.rs` vs
 //! `taproot_swap.rs`) even though the keepalive message is shared.
 
 use bitcoin::Amount;
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
@@ -20,14 +20,17 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::{
+    sync::atomic::Ordering::Relaxed,
+    thread,
+    time::{Duration, Instant},
+};
 
 /// Confirmations to wait for on every funding tx.
 ///
-/// This has to beat the ~3 blocks mined during `MAKER_BROADCAST_DELAY`, or the
-/// first poll already sees enough confirmations, returns immediately, and the
-/// keepalive never gets sent. At 15 the wait sleeps once (10s) and fires one
-/// keepalive per hop, which is all this test needs.
+/// At the normal five-blocks-per-three-seconds mining cadence, 15 confirmations
+/// usually require a polling delay. The paused-mining case below separately
+/// forces a wall-clock wait beyond the maker's pending-connection deadline.
 const REQUIRED_CONFIRMS: u32 = 15;
 
 #[test]
@@ -36,6 +39,7 @@ fn test_legacy_multi_confirm_swap() {
     run_multi_confirm_swap(
         ProtocolVersion::Legacy,
         vec![(9102, Some(21401)), (19102, Some(21402))],
+        false,
     );
 }
 
@@ -45,10 +49,38 @@ fn test_taproot_multi_confirm_swap() {
     run_multi_confirm_swap(
         ProtocolVersion::Taproot,
         vec![(9202, Some(21501)), (19202, Some(21502))],
+        false,
     );
 }
 
-fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16, Option<u16>)>) {
+#[test]
+fn test_legacy_confirmation_wait_exceeds_admission_deadline() {
+    run_multi_confirm_swap(
+        ProtocolVersion::Legacy,
+        vec![(9402, Some(21701)), (19402, Some(21702))],
+        true,
+    );
+}
+
+#[test]
+fn test_taproot_confirmation_wait_exceeds_admission_deadline() {
+    run_multi_confirm_swap(
+        ProtocolVersion::Taproot,
+        vec![(9302, Some(21601)), (19302, Some(21602))],
+        true,
+    );
+}
+
+fn run_multi_confirm_swap(
+    protocol: ProtocolVersion,
+    makers_config_map: Vec<(u16, Option<u16>)>,
+    delay_first_confirmation: bool,
+) {
+    let required_confirms = if delay_first_confirmation {
+        1
+    } else {
+        REQUIRED_CONFIRMS
+    };
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
@@ -99,18 +131,67 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
-        .with_required_confirms(REQUIRED_CONFIRMS);
+        .with_required_confirms(required_confirms);
 
     generate_blocks(bitcoind, 1);
 
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Failed to prepare openswap");
-    taker
-        .start_swap(&summary.swap_id)
-        .expect("OpenSwap should complete successfully despite the longer funding wait");
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let swap_result = if delay_first_confirmation {
+        test_framework.set_block_gen_paused(true);
+        // Let any in-flight mining tick finish before broadcasting funding.
+        thread::sleep(Duration::from_secs(4));
+        let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
+        thread::scope(|scope| {
+            let miner = scope.spawn(|| {
+                // Resume mining even if an assertion fails, so the swap thread
+                // cannot remain blocked in its confirmation wait during unwind.
+                struct ResumeMining<'a>(&'a TestFramework);
+                impl Drop for ResumeMining<'_> {
+                    fn drop(&mut self) {
+                        self.0.set_block_gen_paused(false);
+                    }
+                }
+                let _resume = ResumeMining(&test_framework);
+                let deadline = Instant::now() + Duration::from_secs(120);
+                let funding_txids = loop {
+                    let new_txids: Vec<_> = bitcoind
+                        .client
+                        .get_raw_mempool()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|txid| !mempool_before.contains(txid))
+                        .collect();
+                    if new_txids.len() == 3 {
+                        break new_txids;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "funding never reached the mempool"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                };
+                let height = bitcoind.client.get_block_count().unwrap();
+                info!("Holding taker funding unconfirmed for 30 seconds at height {height}");
+                // The maker's pending connection deadline is 20 seconds in
+                // both production and tests. Cross it with funding unconfirmed.
+                thread::sleep(Duration::from_secs(30));
+                assert_eq!(bitcoind.client.get_block_count().unwrap(), height);
+                let mempool = bitcoind.client.get_raw_mempool().unwrap();
+                assert!(funding_txids.iter().all(|txid| mempool.contains(txid)));
+            });
+            let result = taker.start_swap(&summary.swap_id);
+            miner.join().expect("delayed miner panicked");
+            result
+        })
+    } else {
+        taker.start_swap(&summary.swap_id)
+    };
+    swap_result.expect("OpenSwap should complete successfully despite the longer funding wait");
 
-    info!("OpenSwap completed with required_confirms = {REQUIRED_CONFIRMS}");
+    info!("OpenSwap completed with required_confirms = {required_confirms}");
 
     makers
         .iter()
@@ -135,11 +216,9 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
             .unwrap();
     }
 
-    // The swap succeeding is not enough: without these two lines it could have
-    // taken the single-confirmation path and proved nothing.
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    // Verify the requested confirmation count and that route heartbeats ran.
     test_framework.assert_log(
-        &format!("Waiting for {REQUIRED_CONFIRMS} confirmation(s)"),
+        &format!("Waiting for {required_confirms} confirmation(s)"),
         &log_path,
     );
     test_framework.assert_log("Taker is waiting for funding confirmation", &log_path);
