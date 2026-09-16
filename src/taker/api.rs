@@ -2584,8 +2584,9 @@ impl Taker {
                 let address = utxo
                     .address
                     .as_ref()
-                    .and_then(|addr| addr.clone().require_network(network).ok())
-                    .map(|addr| addr.to_string())
+                    .and_then(|address| address.clone().require_network(network).ok())
+                    .or_else(|| bitcoin::Address::from_script(&utxo.script_pub_key, network).ok())
+                    .map(|address| address.to_string())
                     .unwrap_or_else(|| "Unknown".to_string());
                 (utxo.amount.to_sat(), address)
             })
@@ -2602,8 +2603,9 @@ impl Taker {
                 let address = utxo
                     .address
                     .as_ref()
-                    .and_then(|addr| addr.clone().require_network(network).ok())
-                    .map(|addr| addr.to_string())
+                    .and_then(|address| address.clone().require_network(network).ok())
+                    .or_else(|| bitcoin::Address::from_script(&utxo.script_pub_key, network).ok())
+                    .map(|address| address.to_string())
                     .unwrap_or_else(|| "Unknown".to_string());
                 (utxo.amount.to_sat(), address)
             })
@@ -2762,10 +2764,11 @@ impl Taker {
             .filter_map(|utxo| {
                 let address = utxo
                     .address
-                    .as_ref()?
-                    .clone()
-                    .require_network(network)
-                    .ok()?;
+                    .as_ref()
+                    .and_then(|address| address.clone().require_network(network).ok())
+                    .or_else(|| {
+                        bitcoin::Address::from_script(&utxo.script_pub_key, network).ok()
+                    })?;
                 Some(ReportUtxo {
                     address: address.to_string(),
                     value: utxo.amount.to_sat(),
