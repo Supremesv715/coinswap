@@ -252,7 +252,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
 ) {
     warn!("Running Test: Restart Rebuilds Watches ({protocol:?}, {crash_behavior:?})");
 
-    // The framework assigns real ports itself; these entries only set the count.
+    // The framework assigns real ports; this specifies how many makers to start.
     let maker_count = 2;
     // All three die holding unclaimed contracts, none of them recovering in
     // process, so only the restarts can settle anything.
