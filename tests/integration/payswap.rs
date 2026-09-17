@@ -348,6 +348,7 @@ fn test_legacy_payswap() {
         .as_ref()
         .expect("payment swap report must carry a payment result");
     assert!(payment_result.confirmed);
+    assert_eq!(payment_result.requested_amount, payment_amount.to_sat());
     assert_eq!(payment_result.delivered_amount, payment_amount.to_sat());
     assert_eq!(report.incoming_amount, 0);
     assert!(report.incoming_utxos.is_empty());
