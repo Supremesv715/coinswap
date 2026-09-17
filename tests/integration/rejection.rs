@@ -506,11 +506,7 @@ fn makers_reject_duplicate_funding_outpoints() {
 /// The maker guards a Legacy funding proof in order — entry count, declared
 /// sum, then duplication — so each malice keeps the earlier guards satisfied
 /// to reach its own. One maker is enough: the rejection is the point.
-fn run_legacy_proof_guard(
-    behavior: TakerBehavior,
-    tx_count: u32,
-    expected: &str,
-) {
+fn run_legacy_proof_guard(behavior: TakerBehavior, tx_count: u32, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
@@ -610,11 +606,7 @@ fn maker_rejects_wrong_taproot_incoming_count() {
 /// declaration, so the maker's own equality check is what refuses.
 fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![behavior],
-            vec![MakerBehavior::Normal],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1370,11 +1362,8 @@ fn maker_rejects_forged_swap_details_at_admission_electrum() {
 }
 
 fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
-    let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        1,
-        vec![TakerBehavior::Normal],
-        vec![MakerBehavior::Normal],
-    );
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<B>(1, vec![TakerBehavior::Normal], vec![MakerBehavior::Normal]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
@@ -1471,11 +1460,7 @@ fn run_corrupt_contract_response(
     expected: &str,
 ) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![behavior],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![TakerBehavior::Normal], vec![behavior]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     fund_taker_default(taker, bitcoind, 3);
@@ -2064,11 +2049,8 @@ const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
 fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     warn!("Running Test: {}", s.name);
 
-    let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        1,
-        vec![s.behavior],
-        vec![MakerBehavior::Normal],
-    );
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<B>(1, vec![s.behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
