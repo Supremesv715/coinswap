@@ -13,7 +13,9 @@ use std::{
     thread,
 };
 
-use bitcoin::{consensus::deserialize, Block, Network, OutPoint, ScriptBuf, Transaction};
+use bitcoin::{
+    consensus::deserialize, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction,
+};
 use crossbeam_channel::Sender as CbSender;
 
 use crate::{
@@ -43,6 +45,9 @@ pub struct Watcher<R: Role> {
     /// Watches whose script-subscribe failed; without a retry they stay
     /// undetected until restart. Retried on every event-loop pass.
     pending_subscribes: Vec<(OutPoint, ScriptBuf)>,
+    /// Core block hashes whose height lookup failed. Retried on every loop pass
+    /// without retaining full blocks in memory.
+    pending_block_discovery: Vec<BlockHash>,
     /// Set by `WatchService::shutdown`; long scans check it per iteration so a
     /// deep rescan cannot stall the join.
     shutdown: Arc<AtomicBool>,
@@ -121,6 +126,7 @@ impl<R: Role> Watcher<R> {
             nostr_relays,
             nostr_tor_config,
             pending_subscribes: Vec::new(),
+            pending_block_discovery: Vec::new(),
             shutdown,
             _role: PhantomData,
         }
@@ -234,9 +240,9 @@ impl<R: Role> Watcher<R> {
                     };
                     self.handle_event(event);
                 }
-                // A failed script-subscribe retries on every pass, not just
-                // idle ticks; with an empty queue this is a no-op.
-                self.retry_subscribes();
+                // Failed backend work retries on every pass, not just idle ticks;
+                // with empty queues this is a no-op.
+                self.retry_pending_work();
             }
 
             // Stop and join the discovery thread on exit path.
@@ -436,25 +442,27 @@ impl<R: Role> Watcher<R> {
                 return Ok(());
             }
             let block = self.blockchain.block_at_height(height)?;
-            process_block::<R>(block, &mut self.registry)?;
+            process_block::<R>(block, Some(height), &mut self.registry)?;
         }
         Ok(())
     }
 
-    /// Retry script-subscribes that failed earlier. The backend records a
-    /// subscription only on success, so retrying an armed script is a no-op.
-    fn retry_subscribes(&mut self) {
+    /// Retry failed script subscriptions and Core block discovery. Successful
+    /// subscriptions and completed or orphaned blocks leave their queues.
+    fn retry_pending_work(&mut self) {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        // Destructured so the closure can call the backend while `retain`
-        // holds the vec; borrowing `self` twice would not compile.
+        // Split the field borrows so both retry queues can retain in place.
         let Self {
             blockchain,
+            registry,
             pending_subscribes,
+            pending_block_discovery,
             shutdown,
             ..
         } = self;
+
         pending_subscribes.retain(|(outpoint, spk)| {
             if shutdown.load(Ordering::Relaxed) {
                 return true;
@@ -465,9 +473,47 @@ impl<R: Role> Watcher<R> {
                     false
                 }
                 Err(e) => {
-                    // The outpoint is unwatched while this fails; loud so a
-                    // wedged backend shows before a swap depends on the watch.
+                    // The outpoint remains unwatched while this fails.
                     log::error!("re-subscribe still failing for {outpoint}: {e}");
+                    true
+                }
+            }
+        });
+
+        if !R::RUN_DISCOVERY {
+            return;
+        }
+        let AnyBlockchain::CoreRPC(core) = blockchain else {
+            return;
+        };
+        pending_block_discovery.retain(|block_hash| {
+            if shutdown.load(Ordering::Relaxed) {
+                return true;
+            }
+            let height = match core.block_height(block_hash) {
+                Ok(height) => height,
+                Err(e) => {
+                    log::error!("Could not retry discovery for Core block {block_hash}: {e}");
+                    return true;
+                }
+            };
+            let block = match core.block_at_height(height) {
+                Ok(block) => block,
+                Err(e) => {
+                    log::error!("Could not reload Core block {block_hash} at height {height}: {e}");
+                    return true;
+                }
+            };
+            if block.block_hash() != *block_hash {
+                log::info!("Dropping pending discovery for orphaned Core block {block_hash}");
+                return false;
+            }
+            match process_block::<R>(block, Some(height), registry) {
+                Ok(()) => false,
+                Err(e) => {
+                    log::error!(
+                        "Fidelity discovery retry failed for Core block {block_hash}: {e:?}"
+                    );
                     true
                 }
             }
@@ -515,12 +561,249 @@ impl<R: Role> Watcher<R> {
                 // discovery does not exist on Electrum — it is nostr-only there.
                 if b.hash.len() != 32 {
                     if let Ok(block) = deserialize::<Block>(&b.hash) {
-                        if let Err(e) = process_block::<R>(block, &mut self.registry) {
+                        let confirmation_height = if !R::RUN_DISCOVERY {
+                            None
+                        } else if b.height > 0 {
+                            Some(b.height)
+                        } else {
+                            match &self.blockchain {
+                                AnyBlockchain::CoreRPC(core) => {
+                                    let block_hash = block.block_hash();
+                                    match core.block_height(&block_hash) {
+                                        Ok(height) => Some(height),
+                                        Err(e) => {
+                                            log::error!(
+                                                "Could not resolve connected Core block {block_hash} height; will retry discovery: {e}"
+                                            );
+                                            for tx in &block.txdata {
+                                                if let Err(e) = process_transaction(
+                                                    tx,
+                                                    &mut self.registry,
+                                                    true,
+                                                ) {
+                                                    log::error!(
+                                                        "registry update failed for connected block: {e:?}"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            if !self.pending_block_discovery.contains(&block_hash) {
+                                                self.pending_block_discovery.push(block_hash);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                                AnyBlockchain::Electrum(_) => {
+                                    Some(b.height).filter(|height| *height > 0)
+                                }
+                            }
+                        };
+                        if let Err(e) =
+                            process_block::<R>(block, confirmation_height, &mut self.registry)
+                        {
                             log::error!("registry update failed for connected block: {e:?}");
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        consensus::{encode::serialize_hex, serialize},
+        constants::genesis_block,
+    };
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+    };
+
+    use crate::wallet::{blockchain::BlockRef, CoreRPC, CoreRpcConfig};
+
+    struct DiscoveryRole;
+
+    impl Role for DiscoveryRole {
+        const RUN_DISCOVERY: bool = true;
+    }
+
+    fn core_backend_for(
+        announced_block: &Block,
+        active_block: &Block,
+    ) -> (AnyBlockchain, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");
+        let url = listener.local_addr().unwrap().to_string();
+        let announced_hash = announced_block.block_hash();
+        let active_hash = active_block.block_hash();
+        let active_block_hex = serialize_hex(active_block);
+        let merkle_root = announced_block.header.merkle_root.to_string();
+        let time = announced_block.header.time;
+        let nonce = announced_block.header.nonce;
+        let tx_count = announced_block.txdata.len();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept Core RPC client");
+            let mut writer = stream.try_clone().expect("clone Core RPC stream");
+            let mut reader = BufReader::new(stream);
+
+            for _ in 0..3 {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                assert!(line.starts_with("POST "));
+
+                let mut content_length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "getblockheader" => {
+                        assert_eq!(request["params"], json!([announced_hash, true]));
+                        json!({
+                            "hash": announced_hash,
+                            "confirmations": 1,
+                            "height": 0,
+                            "version": 1,
+                            "merkleroot": merkle_root,
+                            "time": time,
+                            "mediantime": time,
+                            "nonce": nonce,
+                            "bits": "207fffff",
+                            "difficulty": 1.0,
+                            "chainwork": "00",
+                            "nTx": tx_count,
+                        })
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"], json!([0]));
+                        json!(active_hash)
+                    }
+                    "getblock" => {
+                        assert_eq!(request["params"], json!([active_hash, 0]));
+                        json!(active_block_hex)
+                    }
+                    method => panic!("unexpected Core RPC method: {}", method),
+                };
+                let response = json!({
+                    "result": result,
+                    "error": Value::Null,
+                    "id": request["id"],
+                })
+                .to_string();
+                write!(
+                    writer,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                writer.flush().unwrap();
+            }
+        });
+
+        let config = CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        };
+        (
+            AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap()),
+            server,
+        )
+    }
+
+    #[test]
+    fn core_height_failure_queues_and_retries_block_discovery() {
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..CoreRpcConfig::default()
+        };
+        let backend = AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let block = genesis_block(Network::Regtest);
+        let block_hash = block.block_hash();
+        let event = WatchEvent::BlockConnected(BlockRef {
+            height: 0,
+            hash: serialize(&block),
+        });
+
+        watcher.handle_event(event.clone());
+        watcher.handle_event(event);
+        assert_eq!(watcher.pending_block_discovery, vec![block_hash]);
+
+        watcher.retry_pending_work();
+        assert_eq!(watcher.pending_block_discovery, vec![block_hash]);
+    }
+
+    #[test]
+    fn successful_core_retry_processes_and_removes_pending_block() {
+        let block = genesis_block(Network::Regtest);
+        let block_hash = block.block_hash();
+        let (backend, server) = core_backend_for(&block, &block);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        watcher.pending_block_discovery.push(block_hash);
+
+        watcher.retry_pending_work();
+
+        assert!(watcher.pending_block_discovery.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn core_retry_removes_block_orphaned_by_reorg() {
+        let announced_block = genesis_block(Network::Regtest);
+        let announced_hash = announced_block.block_hash();
+        let mut active_block = announced_block.clone();
+        active_block.header.nonce = active_block.header.nonce.wrapping_add(1);
+        assert_ne!(active_block.block_hash(), announced_hash);
+
+        let (backend, server) = core_backend_for(&announced_block, &active_block);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        watcher.pending_block_discovery.push(announced_hash);
+
+        watcher.retry_pending_work();
+
+        assert!(watcher.pending_block_discovery.is_empty());
+        server.join().unwrap();
     }
 }
