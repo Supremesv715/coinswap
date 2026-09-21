@@ -583,8 +583,6 @@ fn maker_rejects_underdelivered_legacy_amount() {
 #[test]
 fn maker_rejects_underdelivered_taproot_amount() {
     run_taproot_declaration_guard(
-        9706,
-        21702,
         TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
         "does not match negotiated swap amount",
     );
@@ -595,8 +593,6 @@ fn maker_rejects_underdelivered_taproot_amount() {
 #[test]
 fn maker_rejects_wrong_taproot_incoming_count() {
     run_taproot_declaration_guard(
-        9708,
-        21703,
         TakerBehavior::ForgeIncomingCount(2),
         "!= declared incoming count",
     );
@@ -604,7 +600,7 @@ fn maker_rejects_wrong_taproot_incoming_count() {
 
 /// The taker funds honestly; the hook forges only the SwapDetails
 /// declaration, so the maker's own equality check is what refuses.
-fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, expected: &str) {
+fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
@@ -1453,8 +1449,6 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
 /// A maker whose contract response is corrupt — overcounted, or repeating one
 /// funded output — is cheating; the taker must refuse it.
 fn run_corrupt_contract_response(
-    port: u16,
-    rpc: u16,
     protocol: ProtocolVersion,
     behavior: MakerBehavior,
     expected: &str,
@@ -1506,8 +1500,6 @@ fn run_corrupt_contract_response(
 #[test]
 fn taker_rejects_overproduced_legacy_contracts() {
     run_corrupt_contract_response(
-        9106,
-        21603,
         ProtocolVersion::Legacy,
         MakerBehavior::OverproduceContractData,
         "its reported plan has",
@@ -1517,8 +1509,6 @@ fn taker_rejects_overproduced_legacy_contracts() {
 #[test]
 fn taker_rejects_overproduced_taproot_contracts() {
     run_corrupt_contract_response(
-        9108,
-        21604,
         ProtocolVersion::Taproot,
         MakerBehavior::OverproduceContractData,
         "its reported plan has",
@@ -1530,8 +1520,6 @@ fn taker_rejects_overproduced_taproot_contracts() {
 #[test]
 fn taker_rejects_duplicated_taproot_contract_outpoint() {
     run_corrupt_contract_response(
-        9114,
-        21607,
         ProtocolVersion::Taproot,
         MakerBehavior::DuplicateContractOutpoint,
         "duplicate Taproot contract outpoint",
@@ -1543,8 +1531,6 @@ fn taker_rejects_duplicated_taproot_contract_outpoint() {
 #[test]
 fn taker_rejects_duplicated_legacy_contract_outpoint() {
     run_corrupt_contract_response(
-        9115,
-        21609,
         ProtocolVersion::Legacy,
         MakerBehavior::DuplicateContractOutpoint,
         "duplicate sender contract for funding outpoint",
@@ -1961,7 +1947,6 @@ fn taker_recovers_partial_broadcast_with_spare_maker_electrum() {
 /// rejected before the maker funds anything.
 struct ReplayScenario {
     name: &'static str,
-    ports: (u16, u16),
     behavior: TakerBehavior,
     protocol: ProtocolVersion,
     taker_utxos: u32,
@@ -1979,7 +1964,6 @@ struct ReplayScenario {
 
 const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
     name: "maker rejects replayed Taproot contract data",
-    ports: (9602, 21421),
     behavior: TakerBehavior::ReplayTaprootContractData,
     protocol: ProtocolVersion::Taproot,
     taker_utxos: 3,
@@ -2000,7 +1984,6 @@ const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
 
 const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
     name: "maker rejects replayed Legacy contract data",
-    ports: (9612, 21422),
     behavior: TakerBehavior::ReplayLegacyProofOfFunding,
     protocol: ProtocolVersion::Legacy,
     taker_utxos: 4,
@@ -2021,7 +2004,6 @@ const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
 
 const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
     name: "maker rejects in-flight replayed Taproot contract data",
-    ports: (9614, 21423),
     behavior: TakerBehavior::ReplayTaprootContractDataInFlight,
     protocol: ProtocolVersion::Taproot,
     taker_utxos: 4,
@@ -2262,7 +2244,6 @@ fn wait_for_log_after(
 /// to one maker, mining paused so every swap stalls in the confirmation wait.
 #[allow(clippy::type_complexity)]
 fn concurrent_replay_setup(
-    ports: (u16, u16),
     behavior: TakerBehavior,
     taker_utxos: u32,
 ) -> (
@@ -2332,7 +2313,7 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
         maker_address,
         log_path,
         log_offset,
-    ) = concurrent_replay_setup((9620, 21426), TakerBehavior::ReplayTaprootContractData, 3);
+    ) = concurrent_replay_setup(TakerBehavior::ReplayTaprootContractData, 3);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
@@ -2437,7 +2418,7 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
         maker_address,
         log_path,
         log_offset,
-    ) = concurrent_replay_setup((9622, 21427), TakerBehavior::ReplayLegacyProofOfFunding, 4);
+    ) = concurrent_replay_setup(TakerBehavior::ReplayLegacyProofOfFunding, 4);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
@@ -2686,31 +2667,27 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 /// steps the maker Good -> Unresponsive in the offerbook.
 #[test]
 fn test_taproot_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot, 9702, 21431);
+    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy, 9703, 21432);
+    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy);
 }
 
 /// Same underpayment on Electrum: the real-fee check reads the funding
 /// inputs' prev txs from the indexer.
 #[test]
 fn test_taproot_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot, 9702, 21431);
+    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy, 9703, 21432);
+    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy);
 }
 
-fn run_rejects_funding_fee_underpayment<B: TestBackend>(
-    protocol: ProtocolVersion,
-    port: u16,
-    rpc: u16,
-) {
+fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
         1,
         vec![TakerBehavior::Normal],
@@ -2766,15 +2743,15 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
 /// violation, on both protocols.
 #[test]
 fn test_taproot_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot, 9704, 21433);
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy, 9705, 21434);
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy);
 }
 
-fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16, rpc: u16) {
+fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             1,
@@ -2852,7 +2829,6 @@ impl Drop for LifetimeOverride {
 /// end of the test or the two-hour default comes back.
 #[allow(clippy::type_complexity)]
 fn keepalive_admission(
-    port: u16,
     taker_behavior: TakerBehavior,
     lifetime_secs: Option<&str>,
     pause_mining: bool,
@@ -2926,7 +2902,7 @@ fn unfunded_swap_dies_at_lifetime_despite_keepalives() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(9811, TakerBehavior::Normal, Some("120"), false);
+    ) = keepalive_admission(TakerBehavior::Normal, Some("120"), false);
 
     let taker = takers.get_mut(0).unwrap();
     let maker = &makers[0];
@@ -3024,7 +3000,7 @@ fn keepalive_with_mempool_funding_still_refreshes() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(9812, TakerBehavior::SkipFundingConfirmWait, None, true);
+    ) = keepalive_admission(TakerBehavior::SkipFundingConfirmWait, None, true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
@@ -3080,12 +3056,7 @@ fn keepalive_naming_unseen_funding_is_refused() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(
-        9813,
-        TakerBehavior::WithholdFundingBroadcast,
-        Some("120"),
-        true,
-    );
+    ) = keepalive_admission(TakerBehavior::WithholdFundingBroadcast, Some("120"), true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));

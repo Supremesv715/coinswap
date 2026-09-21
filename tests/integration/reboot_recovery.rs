@@ -571,8 +571,6 @@ fn reservations_survive_a_maker_restart() {
     run_reservations_survive_restart::<BitcoindBackend>(
         ProtocolVersion::Taproot,
         MakerBehavior::SkipFundingBroadcastUnrecorded,
-        (7452, 20951),
-        (17452, 20952),
     );
 }
 
@@ -583,16 +581,12 @@ fn reservations_survive_a_maker_restart_electrum() {
     run_reservations_survive_restart::<ElectrumBackend>(
         ProtocolVersion::Taproot,
         MakerBehavior::SkipFundingBroadcastUnrecorded,
-        (7453, 20953),
-        (17453, 20954),
     );
 }
 
 fn run_reservations_survive_restart<B: TestBackend>(
     protocol: ProtocolVersion,
     skip_behavior: MakerBehavior,
-    maker1: (u16, u16),
-    maker2: (u16, u16),
 ) {
     warn!("Running Test: swap input reservations survive a maker restart");
 

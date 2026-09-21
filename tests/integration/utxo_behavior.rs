@@ -736,17 +736,17 @@ fn test_manual_coinselection() {
 /// log line "3 receivers, 1 senders" pins the degradation.
 #[test]
 fn test_legacy_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Legacy, 8404, 21701);
+    run_degraded_split_swap(ProtocolVersion::Legacy);
 }
 
 /// Same fragmented pool on Taproot: admission and funding share the planner
 /// with Legacy, so the same degradation must show on the other protocol.
 #[test]
 fn test_taproot_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Taproot, 8405, 21702);
+    run_degraded_split_swap(ProtocolVersion::Taproot);
 }
 
-fn run_degraded_split_swap(protocol: ProtocolVersion, port: u16, rpc: u16) {
+fn run_degraded_split_swap(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             1,

@@ -256,20 +256,18 @@ fn test_standard_openswap() {
 /// swap still completes.
 #[test]
 fn test_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 9203, 21503, 3846, 112);
+    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 3846, 112);
 }
 
 /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
 /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
 #[test]
 fn test_legacy_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 9204, 21504, 4302, 150);
+    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 4302, 150);
 }
 
 fn run_swap_with_custom_feerate(
     protocol: ProtocolVersion,
-    port: u16,
-    rpc: u16,
     expected_fee_paid: u64,
     sweep_vsize_model: u64,
 ) {
