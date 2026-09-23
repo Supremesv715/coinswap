@@ -4,6 +4,7 @@
 //! Each service signals and joins its thread before it is dropped.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -47,14 +48,13 @@ pub(crate) struct RecoveryLoop {
 impl RecoveryLoop {
     /// Spawn the background recovery thread.
     ///
-    /// The `swap_tracker` is used to update per-contract resolution outcomes
-    /// as contracts are resolved in the background. `swap_scope` restricts the
-    /// timelock pass to one swap's coins — the sharing state is per swap.
+    /// The tracker supplies the failed swaps that this loop may recover. The
+    /// scope is refreshed every pass so a live swap can never be selected just
+    /// because its swapcoins share the same wallet.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         data_dir: PathBuf,
-        swap_scope: Option<String>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -67,6 +67,20 @@ impl RecoveryLoop {
             .spawn(move || {
                 log::info!("Recovery loop started");
                 while !shutdown_clone.load(Relaxed) {
+                    let (swap_ids, incoming_contract_txids) = match lock_debug!(swap_tracker.lock())
+                    {
+                        Ok(tracker) => tracker.recovery_scope(),
+                        Err(_) => {
+                            thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                            continue;
+                        }
+                    };
+                    if swap_ids.is_empty() {
+                        log::info!("Recovery loop: no failed swaps remain");
+                        complete_clone.store(true, Relaxed);
+                        return;
+                    }
+
                     // One connection per pass, shared by all three steps below:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
                     let chain = match lock_debug!(wallet.read()) {
@@ -90,7 +104,7 @@ impl RecoveryLoop {
                         &wallet,
                         &chain,
                         &shutdown_clone,
-                        None,
+                        Some(&incoming_contract_txids),
                     ) {
                         Ok(ref swept) if !swept.is_empty() => {
                             log::info!(
@@ -113,7 +127,7 @@ impl RecoveryLoop {
                         &chain,
                         RECOVERY_FEE_RATE,
                         &shutdown_clone,
-                        swap_scope.as_deref(),
+                        Some(&swap_ids),
                         &|coin_swap| funding_shared(&swap_tracker, coin_swap),
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
@@ -135,6 +149,7 @@ impl RecoveryLoop {
                         if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
                             Self::update_tracker_outcomes(
                                 &mut tracker,
+                                &swap_ids,
                                 incoming_result.as_ref(),
                                 outgoing_result.as_ref(),
                             );
@@ -145,8 +160,8 @@ impl RecoveryLoop {
                     // are backend calls and must not hold the wallet.
                     let outpoints = match lock_debug!(wallet.read()) {
                         Ok(w) => {
-                            let mut outpoints = w.outgoing_contract_outpoints();
-                            outpoints.extend(w.incoming_contract_outpoints());
+                            let mut outpoints = w.outgoing_contract_outpoints(Some(&swap_ids));
+                            outpoints.extend(w.incoming_contract_outpoints(Some(&swap_ids)));
                             Some(outpoints)
                         }
                         Err(_) => None,
@@ -176,17 +191,6 @@ impl RecoveryLoop {
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");
-                        // Clean up wallet entries and update tracker
-                        let swap_ids: Vec<String> = lock_debug!(swap_tracker.lock())
-                            .ok()
-                            .map(|t| {
-                                t.incomplete_swaps()
-                                    .iter()
-                                    .map(|r| r.swap_id.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
                         if let Ok(mut w) = lock_debug!(wallet.write()) {
                             for swap_id in &swap_ids {
                                 let keys = w.outgoing_keys_for_swap(swap_id);
@@ -200,7 +204,11 @@ impl RecoveryLoop {
 
                         if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
                             // Emit recovery reports before marking as cleaned up
-                            for record in tracker.incomplete_swaps() {
+                            for record in tracker
+                                .incomplete_swaps()
+                                .into_iter()
+                                .filter(|record| swap_ids.contains(&record.swap_id))
+                            {
                                 let network = lock_debug!(wallet.read())
                                     .map(|w| w.store.network.to_string())
                                     .unwrap_or_default();
@@ -250,6 +258,12 @@ impl RecoveryLoop {
                                 });
                             }
                         }
+                        let more_failed_swaps = lock_debug!(swap_tracker.lock())
+                            .map(|tracker| !tracker.recovery_scope().0.is_empty())
+                            .unwrap_or(true);
+                        if more_failed_swaps {
+                            continue;
+                        }
                         complete_clone.store(true, Relaxed);
                         return;
                     }
@@ -269,12 +283,14 @@ impl RecoveryLoop {
     /// Match resolved contract txids against tracker records and update outcomes.
     fn update_tracker_outcomes(
         tracker: &mut SwapTracker,
+        recovery_scope: &HashSet<String>,
         incoming: Option<&crate::wallet::RecoveryOutcome>,
         outgoing: Option<&crate::wallet::RecoveryOutcome>,
     ) {
         let swap_ids: Vec<String> = tracker
             .incomplete_swaps()
             .iter()
+            .filter(|record| recovery_scope.contains(&record.swap_id))
             .map(|r| r.swap_id.clone())
             .collect();
 

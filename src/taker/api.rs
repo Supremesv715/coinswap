@@ -684,8 +684,8 @@ impl Taker {
 
         // The watcher starts empty, so re-arm every contract still live in the
         // wallet. Without this a restart leaves them undefended.
-        let mut watches = wallet.incoming_contract_outpoints();
-        watches.extend(wallet.outgoing_contract_outpoints());
+        let mut watches = wallet.incoming_contract_outpoints(None);
+        watches.extend(wallet.outgoing_contract_outpoints(None));
         watches.extend(wallet.watchonly_contract_outpoints());
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not rebuild watches on startup: {e}; recovery remains active");
@@ -738,6 +738,18 @@ impl Taker {
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
+        let (swap_ids, incoming_contract_txids) = match lock_debug!(self.swap_tracker.lock()) {
+            Ok(tracker) => tracker.recovery_scope(),
+            Err(_) => {
+                log::warn!("Startup recovery: swap tracker lock poisoned");
+                return;
+            }
+        };
+        if swap_ids.is_empty() {
+            log::info!("startup recovery: Not needed, no failed swaps");
+            return;
+        }
+
         // One connection serves both startup recovery passes; the sweep and
         // timelock recovery each take the lock themselves and drop it across
         // their waits, so a stuck counterparty tx cannot wedge taker startup.
@@ -760,7 +772,7 @@ impl Taker {
                 &self.wallet,
                 chain,
                 &crate::utill::NO_SHUTDOWN,
-                None,
+                Some(&incoming_contract_txids),
             ) {
                 Ok(ref swept) if !swept.is_empty() => {
                     log::info!(
@@ -778,7 +790,7 @@ impl Taker {
                 chain,
                 MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
-                None,
+                Some(&swap_ids),
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
@@ -792,10 +804,14 @@ impl Taker {
             }
         }
 
-        let has_remaining = match self.write_wallet() {
+        let has_remaining = match self.read_wallet() {
             Ok(wallet) => {
-                !wallet.outgoing_contract_outpoints().is_empty()
-                    || !wallet.incoming_contract_outpoints().is_empty()
+                !wallet
+                    .outgoing_contract_outpoints(Some(&swap_ids))
+                    .is_empty()
+                    || !wallet
+                        .incoming_contract_outpoints(Some(&swap_ids))
+                        .is_empty()
             }
             Err(e) => {
                 log::warn!("Startup recovery: failed to lock wallet: {:?}", e);
@@ -817,12 +833,7 @@ impl Taker {
                     return;
                 }
             };
-            match RecoveryLoop::start(
-                self.wallet.clone(),
-                self.swap_tracker.clone(),
-                data_dir,
-                None,
-            ) {
+            match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
                 Ok(rl) => self.recovery_loop = Some(rl),
                 // Without the loop, remaining contracts are never swept.
                 Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
@@ -1217,6 +1228,45 @@ impl Taker {
     /// Commits funds on-chain: creates funding transactions, exchanges
     /// contracts with makers, finalizes, and sweeps.
     pub fn start_swap(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
+        let result = self.start_swap_inner(swap_id);
+        if let Err(error) = &result {
+            if let Err(reconcile_error) = self.reconcile_start_failure(error) {
+                log::error!(
+                    "Failed to persist/recover swap after {:?}: {:?}",
+                    error,
+                    reconcile_error
+                );
+            }
+        }
+        result
+    }
+
+    /// Reconcile any error that escaped swap execution after funding may have
+    /// reached the network. This boundary covers failures from sweep, wallet
+    /// sync, cleanup, and other `?` exits as well as protocol errors.
+    fn reconcile_start_failure(&mut self, error: &TakerError) -> Result<(), TakerError> {
+        let failed_at = match self.ongoing_swap.as_ref() {
+            Some(swap)
+                if matches!(
+                    swap.phase,
+                    SwapPhase::FundsBroadcast
+                        | SwapPhase::ContractsExchanged
+                        | SwapPhase::Finalizing
+                        | SwapPhase::PrivkeysForwarded
+                ) =>
+            {
+                swap.phase
+            }
+            _ => return Ok(()),
+        };
+
+        // Recovery must not depend on this save: the tracker is updated in memory
+        let persisted = self.persist_failure(failed_at, error);
+        let recovered = self.recover_active_swap();
+        persisted.and(recovered)
+    }
+
+    fn start_swap_inner(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         let swap_start_time = Instant::now();
 
         // Verify the swap_id matches the prepared swap.
@@ -1302,18 +1352,10 @@ impl Taker {
                     Err(e) => {
                         log::error!("Legacy contract exchange failed: {:?}", e);
                         self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                        let phase = self
-                            .swap_state()
-                            .map(|s| s.phase)
-                            .unwrap_or(SwapPhase::MakersDiscovered);
                         // Clean up only while the broadcast loop was never
                         // entered; past it the swap goes to recovery.
                         if !self.no_outgoing_funding_on_chain() {
                             log::warn!("Funding txs were broadcast, triggering recovery");
-                            self.persist_failure(phase, &e);
-                            if let Err(re) = self.recover_active_swap() {
-                                log::error!("Recovery failed: {:?}", re);
-                            }
                         } else {
                             log::info!("No funds on-chain — safe to abort");
                             let _ = lock_debug!(self.swap_tracker.lock())
@@ -1334,19 +1376,11 @@ impl Taker {
                 Err(e) => {
                     log::error!("Taproot exchange failed: {:?}", e);
                     self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                    let phase = self
-                        .swap_state()
-                        .map(|s| s.phase)
-                        .unwrap_or(SwapPhase::MakersDiscovered);
                     // Same predicate as Legacy: clean up only while the
                     // broadcast loop was never entered; a swap_state failure
                     // reads as uncertain, so fail toward recovery.
                     if !self.no_outgoing_funding_on_chain() {
                         log::warn!("Funds were broadcast, triggering recovery");
-                        self.persist_failure(phase, &e);
-                        if let Err(re) = self.recover_active_swap() {
-                            log::error!("Recovery failed: {:?}", re);
-                        }
                     } else {
                         log::info!("No funds on-chain — safe to abort");
                         let _ = lock_debug!(self.swap_tracker.lock())
@@ -1375,22 +1409,14 @@ impl Taker {
                 .map(|s| s.phase)
                 .unwrap_or(SwapPhase::FundsBroadcast);
             let err = TakerError::General("Test: broadcast contract after full setup".to_string());
-            self.persist_failure(phase, &err);
+            self.persist_failure(phase, &err)?;
             return Err(err);
         }
 
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::DropAfterFundsBroadcast {
             log::warn!("Test behavior: dropping after contract exchange");
-            let phase = self
-                .swap_state()
-                .map(|s| s.phase)
-                .unwrap_or(SwapPhase::FundsBroadcast);
             let err = TakerError::General("Test: dropped after contract exchange".to_string());
-            self.persist_failure(phase, &err);
-            if let Err(re) = self.recover_active_swap() {
-                log::error!("Recovery failed: {:?}", re);
-            }
             return Err(err);
         }
 
@@ -1400,7 +1426,7 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashAfterContractExchange {
             log::warn!("Test behavior: crashing after contract exchange");
             let err = TakerError::General("Test: crashed after contract exchange".to_string());
-            self.persist_failure(SwapPhase::ContractsExchanged, &err);
+            self.persist_failure(SwapPhase::ContractsExchanged, &err)?;
             return Err(err);
         }
 
@@ -1413,7 +1439,7 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashBeforeRecovery {
             log::warn!("Test behavior: crashing before finalization");
             let err = TakerError::General("Test: crashed before finalization".to_string());
-            self.persist_failure(SwapPhase::Finalizing, &err);
+            self.persist_failure(SwapPhase::Finalizing, &err)?;
             return Err(err);
         }
 
@@ -1422,10 +1448,6 @@ impl Taker {
             Err(e) => {
                 log::error!("Finalization failed after retries: {:?}", e);
                 self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                self.persist_failure(SwapPhase::Finalizing, &e);
-                if let Err(re) = self.recover_active_swap() {
-                    log::error!("Recovery failed: {:?}", re);
-                }
                 return Err(e);
             }
         }
@@ -1464,10 +1486,6 @@ impl Taker {
                 expected_incoming_swapcoins
             ));
             self.emit_failure_report(&initial_utxos, swap_start_time, &err);
-            self.persist_failure(SwapPhase::Finalizing, &err);
-            if let Err(re) = self.recover_active_swap() {
-                log::error!("Recovery failed: {:?}", re);
-            }
             return Err(err);
         }
 
@@ -2717,6 +2735,8 @@ impl Taker {
             incoming.len(),
             wallet.get_incoming_swapcoins_count()
         );
+        drop(wallet);
+        self.persist_progress()?;
         Ok(())
     }
 
@@ -2847,30 +2867,29 @@ impl Taker {
     }
 
     /// Persist a swap failure (SP-ERR) with the phase at which failure occurred.
-    fn persist_failure(&mut self, failed_at: SwapPhase, error: &TakerError) {
-        if let Ok(swap) = self.swap_state() {
-            let swap_id = swap.id.clone();
-            if let Ok(mut record) = self.persist_build_record(swap) {
-                record.phase = SwapPhase::Failed;
-                record.failed_at_phase = Some(failed_at);
-                record.failure_reason = Some(format!("{:?}", error));
-                record.updated_at = now_secs();
-                // The failure was already reported to the caller; a poisoned
-                // tracker here is no reason to panic.
-                let Ok(mut tracker) = lock_debug!(self.swap_tracker.lock()) else {
-                    log::error!("swap tracker lock poisoned; skipping failure persist");
-                    return;
-                };
-                // Preserve existing recovery state if resuming
-                if let Some(existing) = tracker.get_record(&swap_id) {
-                    record.recovery = existing.recovery.clone();
-                    record.created_at = existing.created_at;
-                }
-                if let Err(e) = tracker.save_record(&record) {
-                    log::error!("Failed to persist swap failure: {:?}", e);
-                }
-            }
+    fn persist_failure(
+        &mut self,
+        failed_at: SwapPhase,
+        error: &TakerError,
+    ) -> Result<(), TakerError> {
+        let swap = self.swap_state()?;
+        let swap_id = swap.id.clone();
+        let mut record = self.persist_build_record(swap)?;
+        record.phase = SwapPhase::Failed;
+        record.failed_at_phase = Some(failed_at);
+        record.failure_reason = Some(format!("{:?}", error));
+        record.updated_at = now_secs();
+
+        let mut tracker = lock_debug!(self.swap_tracker.lock())
+            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?;
+        if let Some(existing) = tracker.get_record(&swap_id) {
+            record.recovery = existing.recovery.clone();
+            record.created_at = existing.created_at;
         }
+        tracker.save_record(&record)?;
+        drop(tracker);
+        self.swap_state_mut()?.phase = SwapPhase::Failed;
+        Ok(())
     }
 
     /// Print the swap report and save it beside the wallet file: UTXO diffs,
@@ -3298,6 +3317,9 @@ impl Taker {
         );
         self.ongoing_swap = None;
 
+        if let Some(recovery) = self.recovery_loop.take() {
+            drop(recovery);
+        }
         log::info!("Spawning recovery loop for swap {}", swap_id);
         let data_dir = self
             .config
@@ -3309,7 +3331,6 @@ impl Taker {
             self.wallet.clone(),
             self.swap_tracker.clone(),
             data_dir,
-            Some(swap_id),
         )?);
 
         Ok(())

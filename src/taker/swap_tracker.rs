@@ -6,7 +6,7 @@
 #![allow(missing_docs)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     fmt,
     path::{Path, PathBuf},
@@ -543,6 +543,24 @@ impl SwapTracker {
         })
     }
 
+    /// Swap and incoming-contract IDs that background recovery may act on.
+    ///
+    /// A funded swap that is still executing can have the same wallet entries
+    /// as an abandoned swap. Only an explicit failed state authorizes recovery;
+    /// startup reconciliation changes interrupted funded swaps to that state.
+    pub(crate) fn recovery_scope(&self) -> (HashSet<String>, HashSet<Txid>) {
+        let records = self.data.swaps.values().filter(|record| {
+            record.phase == SwapPhase::Failed && record.recovery.phase < RecoveryPhase::CleanedUp
+        });
+        let mut swap_ids = HashSet::new();
+        let mut incoming_contract_txids = HashSet::new();
+        for record in records {
+            swap_ids.insert(record.swap_id.clone());
+            incoming_contract_txids.extend(record.incoming_contract_txids.iter().copied());
+        }
+        (swap_ids, incoming_contract_txids)
+    }
+
     /// Get a mutable reference to a swap record by ID.
     pub fn get_record_mut(&mut self, swap_id: &str) -> Option<&mut SwapRecord> {
         self.data.swaps.get_mut(swap_id)
@@ -727,6 +745,38 @@ mod tests {
         }];
         tracker.save_record(&record).unwrap();
         assert!(!tracker.legacy_proof_sent_for("swap-taproot"));
+    }
+
+    #[test]
+    fn recovery_scope_contains_only_unresolved_failed_swaps() {
+        let dir = TempDir::new().unwrap();
+        let mut tracker = SwapTracker::load_or_create(dir.path()).unwrap();
+        let active_txid = "0101010101010101010101010101010101010101010101010101010101010101"
+            .parse()
+            .unwrap();
+        let failed_txid = "0202020202020202020202020202020202020202020202020202020202020202"
+            .parse()
+            .unwrap();
+
+        let mut active = make_test_record("active", SwapPhase::FundsBroadcast);
+        active.incoming_contract_txids.push(active_txid);
+        tracker.save_record(&active).unwrap();
+
+        let mut failed = make_test_record("failed", SwapPhase::Failed);
+        failed.incoming_contract_txids.push(failed_txid);
+        tracker.save_record(&failed).unwrap();
+
+        tracker
+            .save_record(&make_test_record("completed", SwapPhase::Completed))
+            .unwrap();
+
+        let mut cleaned = make_test_record("cleaned", SwapPhase::Failed);
+        cleaned.recovery.phase = RecoveryPhase::CleanedUp;
+        tracker.save_record(&cleaned).unwrap();
+
+        let (swap_ids, incoming_txids) = tracker.recovery_scope();
+        assert_eq!(swap_ids, HashSet::from(["failed".to_string()]));
+        assert_eq!(incoming_txids, HashSet::from([failed_txid]));
     }
 
     #[test]

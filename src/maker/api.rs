@@ -695,8 +695,8 @@ impl MakerServer {
         // wallet. Without this a restart leaves them undefended. A failed
         // rescan retries inside the watcher, so an Err here means the watcher
         // is gone and the server will start in recovery-only mode.
-        let mut watches = wallet.incoming_contract_outpoints();
-        watches.extend(wallet.outgoing_contract_outpoints());
+        let mut watches = wallet.incoming_contract_outpoints(None);
+        watches.extend(wallet.outgoing_contract_outpoints(None));
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
@@ -1796,7 +1796,7 @@ impl MakerTrait for MakerServer {
             return Ok(false);
         }
         Ok(wallet
-            .outgoing_contract_outpoints()
+            .outgoing_contract_outpoints(None)
             .into_iter()
             .any(|(outpoint, _)| outpoint.txid == *txid))
     }

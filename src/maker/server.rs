@@ -1,6 +1,7 @@
 //! OpenSwap Maker Server.
 
 use std::{
+    collections::HashSet,
     io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
@@ -1422,12 +1423,13 @@ fn recover_from_swap(
             let legacy_funding_shared = outgoing_swapcoins
                 .first()
                 .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
+            let swap_scope = HashSet::from([swap_id.clone()]);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
                 RECOVERY_FEE_RATE,
                 &maker.shutdown,
-                Some(&swap_id),
+                Some(&swap_scope),
                 // Legacy funding rides the contract-sig response, so the peer
                 // may hold it even when we never broadcast. The pass is scoped
                 // to one swap, so every coin gets the same answer.

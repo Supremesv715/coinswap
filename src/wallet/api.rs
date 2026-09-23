@@ -805,11 +805,22 @@ impl Wallet {
         self.store.outgoing_swapcoins.len()
     }
 
-    /// Returns contract outpoints and their scriptPubKeys for all persisted outgoing swapcoins.
-    pub(crate) fn outgoing_contract_outpoints(&self) -> Vec<(OutPoint, ScriptBuf)> {
+    /// Returns persisted outgoing contract outpoints, optionally restricted to
+    /// the supplied swaps.
+    pub(crate) fn outgoing_contract_outpoints(
+        &self,
+        swap_scope: Option<&HashSet<String>>,
+    ) -> Vec<(OutPoint, ScriptBuf)> {
         self.store
             .outgoing_swapcoins
             .values()
+            .filter(|sc| {
+                swap_scope.is_none_or(|ids| {
+                    sc.swap_id
+                        .as_ref()
+                        .is_some_and(|swap_id| ids.contains(swap_id))
+                })
+            })
             .map(|sc| {
                 let vout = sc.get_contract_output_vout();
                 (
@@ -823,11 +834,22 @@ impl Wallet {
             .collect()
     }
 
-    /// Returns contract outpoints and their scriptPubKeys for all persisted incoming swapcoins.
-    pub(crate) fn incoming_contract_outpoints(&self) -> Vec<(OutPoint, ScriptBuf)> {
+    /// Returns persisted incoming contract outpoints, optionally restricted to
+    /// the supplied swaps.
+    pub(crate) fn incoming_contract_outpoints(
+        &self,
+        swap_scope: Option<&HashSet<String>>,
+    ) -> Vec<(OutPoint, ScriptBuf)> {
         self.store
             .incoming_swapcoins
             .values()
+            .filter(|sc| {
+                swap_scope.is_none_or(|ids| {
+                    sc.swap_id
+                        .as_ref()
+                        .is_some_and(|swap_id| ids.contains(swap_id))
+                })
+            })
             .map(|sc| {
                 let vout = sc.get_contract_output_vout();
                 (
@@ -1017,7 +1039,7 @@ impl Wallet {
     ///
     /// The caller supplies the backend connection: the confirmation waits run
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
-    /// Without a `swap_scope` every eligible outgoing swapcoin is considered.
+    /// Without `swap_scope` every eligible outgoing swapcoin is considered.
     ///
     /// `feerate` must be our own: the peer that abandoned the swap does not get
     /// to price our refund. Callers pass [`crate::utill::RECOVERY_FEE_RATE`].
@@ -1031,7 +1053,7 @@ impl Wallet {
         chain: &AnyBlockchain,
         fee_rate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
-        swap_scope: Option<&str>,
+        swap_scope: Option<&HashSet<String>>,
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
     ) -> Result<RecoveryOutcome, WalletError> {
         let mut outcome = RecoveryOutcome::default();
@@ -1046,7 +1068,13 @@ impl Wallet {
                 .outgoing_swapcoins
                 .iter()
                 .filter(|(_, sc)| sc.my_privkey.is_some())
-                .filter(|(_, sc)| swap_scope.is_none_or(|id| sc.swap_id.as_deref() == Some(id)))
+                .filter(|(_, sc)| {
+                    swap_scope.is_none_or(|ids| {
+                        sc.swap_id
+                            .as_ref()
+                            .is_some_and(|swap_id| ids.contains(swap_id))
+                    })
+                })
                 .filter_map(|(swap_id, sc)| {
                     sc.get_timelock()
                         .map(|timelock| (swap_id.clone(), sc.clone(), timelock))
