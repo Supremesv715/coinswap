@@ -3412,10 +3412,7 @@ pub(crate) fn wait_for_tx_confirmation(
         txids.len()
     );
 
-    // cap at ~1 block interval
-    let max_backoff_secs: u64 = 600;
-    let sleep_increment_secs: u64 = 10;
-    let mut attempt: u64 = 0;
+    const SYNC_INTERVAL_SECS: u64 = 10;
 
     let started = Instant::now();
     let mut unseen: HashSet<Txid> = txids.iter().copied().collect();
@@ -3437,8 +3434,6 @@ pub(crate) fn wait_for_tx_confirmation(
                 "Tx did not confirm before the confirmation deadline".to_string(),
             ));
         }
-
-        attempt = attempt.saturating_add(1);
 
         let mut all_confirmed = true;
         let mut max_confirm_height: u32 = 0;
@@ -3513,13 +3508,10 @@ pub(crate) fn wait_for_tx_confirmation(
             return Ok(max_confirm_height);
         }
 
-        let total_sleep = sleep_increment_secs
-            .saturating_mul(attempt)
-            .min(max_backoff_secs);
-        log::info!("Next sync in {} secs", total_sleep);
+        log::info!("Next sync in {} secs", SYNC_INTERVAL_SECS);
 
         // Sleep in 1-second increments so we can check shutdown/abort.
-        for _ in 0..total_sleep {
+        for _ in 0..SYNC_INTERVAL_SECS {
             if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
                 return Err(WalletError::Interrupted("Shutdown requested"));
             }

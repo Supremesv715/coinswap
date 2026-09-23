@@ -951,12 +951,9 @@ impl MakerServer {
             );
 
             // Wait for funds and create fidelity bond
-            let sleep_increment = 10;
-            let mut sleep_multiplier = 0;
+            const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
             while !self.shutdown.load(Ordering::Relaxed) {
-                sleep_multiplier += 1;
-
                 log::info!("Sync at:----setup_fidelity_bond----");
                 lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -993,9 +990,8 @@ impl MakerServer {
                                 addr
                             );
 
-                            let total_sleep = sleep_increment * sleep_multiplier.min(60);
-                            log::info!("Next sync in {total_sleep:?} secs");
-                            if !self.wait_for_shutdown(Duration::from_secs(total_sleep)) {
+                            log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
+                            if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::General("Shutdown requested"));
                             }
                         } else {
@@ -1054,8 +1050,7 @@ impl MakerServer {
 
     /// Check if maker has enough liquidity for swaps.
     pub fn check_swap_liquidity(&self) -> Result<(), MakerError> {
-        let sleep_increment = 10u64;
-        let mut sleep_duration = 0u64;
+        const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
         let addr = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -1081,9 +1076,8 @@ impl MakerServer {
                     "Low Swap Liquidity | Min: {min_required} sats | Available: {offer_max_size} sats. Add funds to {addr:?}"
                 );
 
-                sleep_duration = (sleep_duration + sleep_increment).min(600);
-                log::info!("Next sync in {sleep_duration:?} secs");
-                if !self.wait_for_shutdown(Duration::from_secs(sleep_duration)) {
+                log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
+                if !self.wait_for_shutdown(SYNC_INTERVAL) {
                     break;
                 }
             } else {
