@@ -69,6 +69,7 @@ impl Wallet {
         tmp.as_file().sync_all()?;
         tmp.persist(&backup_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
 
         Ok(())
@@ -345,7 +346,18 @@ mod tests {
         let target = dir.path().join("wallets");
         std::fs::create_dir_all(&target).unwrap();
         let backend = BackendConfig::CoreRpc(CoreRpcConfig::default());
-        for bad in ["../escape", "/tmp/absolute", "nested/name"] {
+        #[cfg(not(windows))]
+        let bad_names = vec!["../escape", "/tmp/absolute", "nested/name"];
+        #[cfg(windows)]
+        let bad_names = vec![
+            "../escape",
+            "/tmp/absolute",
+            "nested/name",
+            "..\\escape",
+            "C:\\absolute",
+            "nested\\name",
+        ];
+        for bad in bad_names {
             let err = Wallet::restore(
                 &dummy_backup(bad),
                 &target,

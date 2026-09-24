@@ -1,0 +1,116 @@
+name: Windows tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  tools:
+    name: Build Windows test tools
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-test-tools-electrs-0.10.8-relay-0.9.0
+
+      - name: Install protobuf compiler
+        shell: pwsh
+        run: choco install protoc --no-progress -y
+
+      # electrsd 0.28 only bundles Linux and macOS executables. electrs 0.10.8
+      # is the first release whose process shutdown path supports Windows.
+      - name: Build test daemons
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\openswap-tools"
+          $env:LIBCLANG_PATH = "$env:ProgramFiles\LLVM\bin"
+          cargo install --root $root --git https://github.com/romanz/electrs --tag v0.10.8 --locked
+          cargo install --root $root nostr-rs-relay --version 0.9.0 --locked
+
+      - name: Upload test daemons
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-daemons
+          path: ${{ runner.temp }}/openswap-tools/bin/*.exe
+          retention-days: 1
+
+  test:
+    name: Windows tests (${{ matrix.partition }}/${{ strategy.job-total }})
+    runs-on: windows-latest
+    timeout-minutes: 180
+    needs: tools
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-tests-${{ matrix.partition }}-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Install protobuf compiler
+        shell: pwsh
+        run: choco install protoc --no-progress -y
+
+      - name: Download test daemons
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-test-daemons
+          path: ${{ runner.temp }}/openswap-tools
+
+      - name: Configure test daemons
+        shell: pwsh
+        run: |
+          "ELECTRS_EXEC=$env:RUNNER_TEMP\openswap-tools\electrs.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSWAP_TEST_NOSTR_RELAY_BIN=$env:RUNNER_TEMP\openswap-tools\nostr-rs-relay.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Bitcoin Core 28.1
+        shell: pwsh
+        run: |
+          $base = "https://bitcoincore.org/bin/bitcoin-core-28.1"
+          $archive = "$env:RUNNER_TEMP\bitcoin-28.1-win64.zip"
+          Invoke-WebRequest "$base/bitcoin-28.1-win64.zip" -OutFile $archive
+          $sums = (Invoke-WebRequest "$base/SHA256SUMS").Content -split "`n"
+          $line = $sums | Where-Object { $_ -match "\sbitcoin-28.1-win64.zip\s*$" }
+          if (-not $line) { throw "Bitcoin Core checksum was not found" }
+          $expected = ($line -split "\s+")[0].ToLowerInvariant()
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Bitcoin Core checksum mismatch" }
+          Expand-Archive $archive -DestinationPath "$env:GITHUB_WORKSPACE\bin" -Force
+          "BITCOIND_TARBALL_FILE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run tests
+        env:
+          ELECTRS_LOG: "1"
+        run: >-
+          cargo nextest run
+          --features integration-test
+          --retries 1
+          --max-fail 2:immediate
+          --partition hash:${{ matrix.partition }}/${{ strategy.job-total }}
+          --no-capture

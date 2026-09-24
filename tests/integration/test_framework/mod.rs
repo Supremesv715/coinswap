@@ -104,16 +104,43 @@ fn read_tarball_from_file(path: &str) -> Vec<u8> {
     buffer
 }
 
-fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
-    let decoder = GzDecoder::new(tarball_bytes);
-    let mut archive = Archive::new(decoder);
-    for mut entry in archive.entries().unwrap().flatten() {
-        if let Ok(file) = entry.path() {
-            if file.ends_with("bitcoind") {
-                entry.unpack_in(destination).unwrap();
+fn unpack_bitcoind(archive_bytes: &[u8], archive_name: &str, destination: &Path) {
+    let executable_name = if archive_name.contains("-win") {
+        "bitcoind.exe"
+    } else {
+        "bitcoind"
+    };
+
+    if archive_name.ends_with(".zip") {
+        let reader = std::io::Cursor::new(archive_bytes);
+        let mut archive = zip::ZipArchive::new(reader).expect("invalid Bitcoin Core zip archive");
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let Some(path) = entry.enclosed_name() else {
+                continue;
+            };
+            if path.file_name() == Some(std::ffi::OsStr::new(executable_name)) {
+                let output_path = destination.join(path);
+                std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+                let mut output = File::create(output_path).unwrap();
+                std::io::copy(&mut entry, &mut output).unwrap();
+                return;
+            }
+        }
+    } else {
+        let decoder = GzDecoder::new(archive_bytes);
+        let mut archive = Archive::new(decoder);
+        for mut entry in archive.entries().unwrap().flatten() {
+            if let Ok(path) = entry.path() {
+                if path.file_name() == Some(std::ffi::OsStr::new(executable_name)) {
+                    entry.unpack_in(destination).unwrap();
+                    return;
+                }
             }
         }
     }
+
+    panic!("{} was not found in {}", executable_name, archive_name);
 }
 
 fn get_bitcoind_filename(os: &str, arch: &str) -> String {
@@ -122,8 +149,54 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> String {
         ("macos", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin.tar.gz"),
         ("linux", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"),
         ("linux", "aarch64") => format!("bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"),
-        _ => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin-unsigned.zip"),
+        ("windows", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-win64.zip"),
+        _ => panic!("unsupported Bitcoin Core test platform: {}/{}", os, arch),
     }
+}
+
+#[test]
+fn windows_bitcoind_archive_name_is_native() {
+    assert_eq!(
+        get_bitcoind_filename("windows", "x86_64"),
+        format!("bitcoin-{BITCOIN_VERSION}-win64.zip")
+    );
+}
+
+#[test]
+fn windows_bitcoind_zip_is_extracted_with_exe_suffix() {
+    use std::io::Write;
+
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file(
+            "bitcoin-28.1/bin/bitcoind.exe",
+            zip::write::FileOptions::default(),
+        )
+        .unwrap();
+    archive.write_all(b"test executable").unwrap();
+    let bytes = archive.finish().unwrap().into_inner();
+    let destination = tempfile::tempdir().unwrap();
+
+    unpack_bitcoind(&bytes, "bitcoin-28.1-win64.zip", destination.path());
+
+    assert_eq!(
+        std::fs::read(destination.path().join("bitcoin-28.1/bin/bitcoind.exe")).unwrap(),
+        b"test executable"
+    );
+}
+
+fn toml_string(value: &Path) -> String {
+    // JSON and TOML basic strings use compatible escaping for backslashes and
+    // quotes. This avoids invalid `C:\...` TOML on Windows.
+    serde_json::to_string(&value.to_string_lossy()).unwrap()
+}
+
+#[test]
+fn toml_path_escapes_windows_separators() {
+    assert_eq!(
+        toml_string(Path::new(r"C:\relay\data")),
+        r#""C:\\relay\\data""#
+    );
 }
 
 /// Initiate the bitcoind backend. Fallible so the caller can retry on a fresh
@@ -176,7 +249,7 @@ pub(crate) fn init_bitcoind(
             create_dir_all(parent).unwrap();
         }
 
-        unpack_tarball(&tarball_bytes, &bitcoin_bin_dir);
+        unpack_bitcoind(&tarball_bytes, &download_filename, &bitcoin_bin_dir);
 
         if os == "macos" {
             let bitcoind_binary = bitcoin_exe_home.join("bitcoind");
@@ -189,7 +262,12 @@ pub(crate) fn init_bitcoind(
         }
     }
 
-    env::set_var("BITCOIND_EXE", bitcoin_exe_home.join("bitcoind"));
+    let bitcoind_name = if cfg!(windows) {
+        "bitcoind.exe"
+    } else {
+        "bitcoind"
+    };
+    env::set_var("BITCOIND_EXE", bitcoin_exe_home.join(bitcoind_name));
 
     let exe_path = bitcoind::exe_path().unwrap();
 
@@ -1377,9 +1455,9 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
     // Minimal per-test relay config: bind the given port and use an in-memory
     // SQLite DB so nothing persists across or leaks between tests.
     let config_path = data_dir.join("config.toml");
+    let data_dir = toml_string(&data_dir);
     let config = format!(
-        "[network]\naddress = \"127.0.0.1\"\nport = {port}\n\n[database]\ndata_directory = \"{data_dir}\"\nin_memory = true\nmin_conn = 4\nmax_conn = 8\n\n[diagnostics]\ntracing = false\n",
-        data_dir = data_dir.display()
+        "[network]\naddress = \"127.0.0.1\"\nport = {port}\n\n[database]\ndata_directory = {data_dir}\nin_memory = true\nmin_conn = 4\nmax_conn = 8\n\n[diagnostics]\ntracing = false\n"
     );
     std::fs::write(&config_path, config).unwrap();
 

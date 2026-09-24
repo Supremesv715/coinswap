@@ -1924,16 +1924,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_offerbook_write_preserves_existing_file() {
+    fn offerbook_write_replaces_existing_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
         let mut book = OfferBook::default();
         book.write_to_disk(&path).unwrap();
 
-        std::fs::create_dir(path.with_extension("partial")).unwrap();
         book.makers.push(candidate(addr("6104")));
-        assert!(book.write_to_disk(&path).is_err());
-        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+        book.write_to_disk(&path).unwrap();
+        assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 1);
     }
 
     #[test]

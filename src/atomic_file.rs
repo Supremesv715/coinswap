@@ -3,7 +3,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io,
+    io::{self, Write},
     path::Path,
 };
 
@@ -57,15 +57,44 @@ pub(crate) fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Resul
 
 pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let json = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
-    let temporary_path = path.with_extension("partial");
+    write_bytes_atomically(path, json.as_bytes())
+}
 
-    {
-        use io::Write;
+/// Durably replace `path` with `contents` without exposing a partially-written file.
+///
+/// `std::fs::rename` cannot replace an existing destination on Windows. A named
+/// temporary file uses the platform's replace operation there while retaining
+/// rename-over semantics on Unix.
+pub(crate) fn write_bytes_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
 
-        let mut temporary_file = std::fs::File::create(&temporary_path)?;
-        temporary_file.write_all(json.as_bytes())?;
-        temporary_file.sync_all()?;
+    let mut temporary_file = tempfile::NamedTempFile::new_in(parent)?;
+    temporary_file.write_all(contents)?;
+    temporary_file.as_file().sync_all()?;
+    temporary_file.persist(path).map_err(|error| error.error)?;
+
+    // Syncing a directory makes the rename durable on Unix. Windows does not
+    // permit opening directories with `File::open`; MoveFileExW has already
+    // completed the replacement before `persist` returns.
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_bytes_atomically;
+
+    #[test]
+    fn atomic_write_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.cbor");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_bytes_atomically(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"new");
     }
-
-    std::fs::rename(&temporary_path, path)
 }

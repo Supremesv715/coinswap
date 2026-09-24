@@ -294,7 +294,9 @@ impl WalletStore {
         tmp.as_file().sync_all()?;
         tmp.persist(path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Without this the rename itself may not survive a crash.
+        // Without this the rename itself may not survive a crash. Windows does
+        // not allow a directory to be opened with `File::open`.
+        #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
     }

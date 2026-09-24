@@ -16,7 +16,9 @@ use std::{
 use bitcoin::{secp256k1::SecretKey, Txid};
 use serde::{Deserialize, Serialize};
 
-use crate::{lock_debug, protocol::common_messages::ProtocolVersion};
+use crate::{
+    atomic_file::write_bytes_atomically, lock_debug, protocol::common_messages::ProtocolVersion,
+};
 
 use super::error::TakerError;
 
@@ -466,19 +468,9 @@ impl SwapTracker {
 
     /// Atomic flush: write to tmp file, then rename over original.
     fn flush(&self) -> Result<(), TakerError> {
-        let tmp_path = self.path.with_extension("cbor.tmp");
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let bytes = serde_cbor::to_vec(&self.data)
             .map_err(|e| TakerError::General(format!("Failed to serialize swap tracker: {}", e)))?;
-
-        std::fs::write(&tmp_path, &bytes)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-
-        Ok(())
+        write_bytes_atomically(&self.path, &bytes).map_err(TakerError::IO)
     }
 
     /// Upsert a swap record and flush to disk.

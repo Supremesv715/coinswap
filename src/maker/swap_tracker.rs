@@ -14,7 +14,7 @@ use std::{
 use bitcoin::Txid;
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::common_messages::ProtocolVersion;
+use crate::{atomic_file::write_bytes_atomically, protocol::common_messages::ProtocolVersion};
 
 use super::error::MakerError;
 
@@ -195,23 +195,13 @@ impl MakerSwapTracker {
 
     /// Atomic flush: write to tmp file, then rename over original.
     fn flush(&self) -> Result<(), MakerError> {
-        let tmp_path = self.path.with_extension("cbor.tmp");
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let bytes = serde_cbor::to_vec(&self.data).map_err(|e| {
             MakerError::IO(std::io::Error::other(format!(
                 "Failed to serialize maker swap tracker: {}",
                 e
             )))
         })?;
-
-        std::fs::write(&tmp_path, &bytes)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-
-        Ok(())
+        write_bytes_atomically(&self.path, &bytes).map_err(MakerError::IO)
     }
 
     /// Upsert a swap record and flush to disk.
